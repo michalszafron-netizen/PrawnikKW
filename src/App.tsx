@@ -22,6 +22,7 @@ export default function App() {
   const [parsedResult, setParsedResult] = useState<{
     structured: KWData;
     drafts: { classic: string; modern: string; short: string };
+    rawApify?: any;
   } | null>(null);
 
   // Legal facts listed during loader screens to calm the user
@@ -45,13 +46,14 @@ export default function App() {
     setIsLoading(false);
   };
 
-  const handleSimulationDataLoaded = (data: KWData) => {
+  const handleSimulationDataLoaded = (data: KWData, rawApify?: any) => {
     // Since simulation returns the structured JSON, we quickly build corresponding standard drafts
     const nameStr = data.dzial2.owners.map((o) => `${o.name} (${o.share})`).join(" oraz ");
     const typeStr = data.dzial1O.propertyType === "lokal" ? "lokal wyodrębniony" : "dzialka";
     
     setParsedResult({
       structured: data,
+      rawApify,
       drafts: {
         classic: `Z księgi wieczystej numer ${data.kwNumber} prowadzonej przez ${data.sadRejonowy}, ${data.wydzialKw}, wynika, że: w Dziale I-O wpisana jest nieruchomość stanowiąca ${typeStr} o powierzchni ${data.dzial1O.totalAreaStr}, położona w m. ${data.dzial1O.location}. W dziale II jako właściciel ujawniony jest: ${nameStr} na podstawie ${data.dzial2.owners[0]?.basisOfAcquisition || "dostępnych podstaw nabycia"}. Dział III ${data.dzial3.hasEntries ? "zawiera wpisy obciążeń/ostrzeżeń" : "nie zawiera wpisów"}. Dział IV ${data.dzial4.hasEntries ? `zawiera zabezpieczenie hipoteczne w kwocie ${data.dzial4.mortgages[0]?.amount.toLocaleString()} ${data.dzial4.mortgages[0]?.currency} na rzecz ${data.dzial4.mortgages[0]?.creditor}` : "jest wolny od wpisów (brak hipotek)"}.`,
         modern: `Stan prawny nieruchomości o numerze KW ${data.kwNumber} (${data.sadRejonowy}):\n\n1. Oznaczenie nieruchomości: ${data.dzial1O.location}, powierzchni ${data.dzial1O.totalAreaStr}.\n2. Własność: Ujawniono właścicieli: ${nameStr}.\n3. Obciążenia: Działy III i IV wykazują status obciążeń we właściwych rubrykach.`,
@@ -194,6 +196,7 @@ export default function App() {
             <NotaryEditor
               initialData={parsedResult.structured}
               initialDrafts={parsedResult.drafts}
+              rawApify={parsedResult.rawApify}
               onReimport={handleBackToSelect}
             />
           </div>

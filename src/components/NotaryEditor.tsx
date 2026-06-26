@@ -34,10 +34,14 @@ import {
   FieldVisibilityConfig,
   DEFAULT_FIELD_VISIBILITY,
 } from "../types";
+import RubricViewer from "./RubricViewer";
+
+type EditorViewMode = "editor" | "rubrics";
 
 interface NotaryEditorProps {
   initialData: KWData;
   initialDrafts: { classic: string; modern: string; short: string };
+  rawApify?: any;
   onReimport: () => void;
 }
 
@@ -165,6 +169,7 @@ function ApplicationDataBlock({ data }: { data?: string }) {
 export default function NotaryEditor({
   initialData,
   initialDrafts,
+  rawApify,
   onReimport,
 }: NotaryEditorProps) {
   const [data, setData] = useState<KWData>(initialData);
@@ -177,6 +182,7 @@ export default function NotaryEditor({
     DEFAULT_FIELD_VISIBILITY
   );
   const [showFilters, setShowFilters] = useState(false);
+  const [viewMode, setViewMode] = useState<EditorViewMode>("editor");
 
   useEffect(() => {
     setData(initialData);
@@ -546,6 +552,37 @@ export default function NotaryEditor({
               Zmień źródło
             </button>
           </div>
+
+          {/* View mode toggle */}
+          <div className="flex border border-[#D1CEC8] bg-[#F5F2ED]">
+            <button
+              type="button"
+              onClick={() => setViewMode("editor")}
+              className={`flex-1 py-2 text-center text-[10px] uppercase font-bold tracking-widest cursor-pointer transition-colors ${
+                viewMode === "editor"
+                  ? "bg-white text-[#1A1A1A] border-b-2 border-[#1A1A1A]"
+                  : "text-[#7A7772] hover:text-[#1A1A1A]"
+              }`}
+            >
+              Edytor
+            </button>
+            <button
+              type="button"
+              onClick={() => setViewMode("rubrics")}
+              className={`flex-1 py-2 text-center text-[10px] uppercase font-bold tracking-widest cursor-pointer transition-colors ${
+                viewMode === "rubrics"
+                  ? "bg-white text-[#1A1A1A] border-b-2 border-[#1A1A1A]"
+                  : "text-[#7A7772] hover:text-[#1A1A1A]"
+              }`}
+            >
+              Rubryki
+            </button>
+          </div>
+
+          {viewMode === "rubrics" ? (
+            <RubricViewer rawApify={rawApify} kwNumber={data.kwNumber} />
+          ) : (
+          <>
 
           {/* Filter bar */}
           <div className="bg-[#F5F2ED] border border-[#D1CEC8] p-3">
@@ -1317,6 +1354,8 @@ export default function NotaryEditor({
               ? "Synchronizowanie z AI..."
               : "Przeładuj i zsynchronizuj tekst"}
           </button>
+          </>
+          )}
         </div>
       </div>
 

@@ -4,12 +4,66 @@
  */
 
 import React, { useState, useEffect } from "react";
-import { Search, Server, Shield, Smartphone, ArrowRight, Check, AlertCircle, RefreshCw, Layers, Settings2 } from "lucide-react";
+import { Search, Server, Shield, Smartphone, ArrowRight, Check, AlertCircle, RefreshCw, Layers, Settings2, BookOpen, Trash2, Clock, Download } from "lucide-react";
 import { PRECONFIGURED_EXAMPLES } from "../data/examples";
 import { KWData } from "../types";
 
+interface CachedKW {
+  kwNumber: string;
+  viewType: "aktualna" | "zupelna";
+  fetchedAt: string;
+  lastEntryDate: string;
+  sadRejonowy: string;
+  propertyType: string;
+  ownerNames: string[];
+  data: KWData;
+  rawApify?: any;
+}
+
+const KW_CACHE_KEY = "lexparser_kw_cache";
+
+function getCachedBooks(): CachedKW[] {
+  try {
+    const raw = localStorage.getItem(KW_CACHE_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch { return []; }
+}
+
+function saveCachedBooks(books: CachedKW[]) {
+  localStorage.setItem(KW_CACHE_KEY, JSON.stringify(books));
+}
+
+function addToCache(entry: CachedKW) {
+  const books = getCachedBooks();
+  const idx = books.findIndex(b => b.kwNumber === entry.kwNumber && b.viewType === entry.viewType);
+  if (idx >= 0) books[idx] = entry;
+  else books.unshift(entry);
+  saveCachedBooks(books);
+}
+
+function removeFromCache(kwNumber: string, viewType: string) {
+  const books = getCachedBooks().filter(b => !(b.kwNumber === kwNumber && b.viewType === viewType));
+  saveCachedBooks(books);
+}
+
+function extractLastEntryDate(data: KWData, rawApify?: any): string {
+  if (!rawApify) return "";
+  const allSections = [rawApify.dzialIO, rawApify.dzialISp, rawApify.dzialII, rawApify.dzialIII, rawApify.dzialIV].filter(Boolean);
+  const dates: string[] = [];
+  for (const section of allSections) {
+    for (const entry of (section.entries || [])) {
+      if (entry.label === "_header" && /^DZ\. KW/i.test(entry.value || "")) {
+        const dateMatch = (entry.value || "").match(/(\d{4}-\d{2}-\d{2})/);
+        if (dateMatch) dates.push(dateMatch[1]);
+      }
+    }
+  }
+  dates.sort();
+  return dates.length > 0 ? dates[dates.length - 1] : "";
+}
+
 interface EKWBrowserSimProps {
-  onDataLoaded: (data: KWData) => void;
+  onDataLoaded: (data: KWData, rawApify?: any) => void;
   onStartLoading: () => void;
   onStopLoading: () => void;
 }
@@ -19,7 +73,7 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
   const [courtCode, setCourtCode] = useState("WA1M");
   const [bookNumber, setBookNumber] = useState("00348754");
   const [controlNum, setControlNum] = useState("2");
-  
+
   // View type toggle
   const [viewType, setViewType] = useState<"aktualna" | "zupelna">("zupelna");
 
@@ -37,8 +91,40 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
   const [logs, setLogs] = useState<string[]>([]);
   const [simulatedResult, setSimulatedResult] = useState<KWData | null>(null);
 
+  // Library state
+  const [cachedBooks, setCachedBooks] = useState<CachedKW[]>(getCachedBooks());
+  const [showLibrary, setShowLibrary] = useState(false);
+
   // Auto compile current book number
   const fullKW = `${courtCode}/${bookNumber}/${controlNum}`;
+
+  const loadFromCache = (cached: CachedKW) => {
+    const data: KWData = {
+      ...cached.data,
+      notarySettings: {
+        includePesels,
+        includeAcquisitionBasis,
+        useAbbreviations,
+        uppercaseNames,
+        spellOutNumbers
+      }
+    };
+    setSimulatedResult(data);
+    onDataLoaded(data, cached.rawApify);
+    const parts = cached.kwNumber.split("/");
+    if (parts.length === 3) {
+      setCourtCode(parts[0]);
+      setBookNumber(parts[1]);
+      setControlNum(parts[2]);
+    }
+    setViewType(cached.viewType);
+    setStep("success");
+  };
+
+  const handleDeleteCached = (kwNumber: string, vt: string) => {
+    removeFromCache(kwNumber, vt);
+    setCachedBooks(getCachedBooks());
+  };
 
   // Predefined quick select
   const handleQuickSelect = (exampleId: string) => {
@@ -170,8 +256,22 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
             spellOutNumbers
           }
         };
+        const lastEntry = extractLastEntryDate(dataWithSettings, parsed.raw);
+        const cacheEntry: CachedKW = {
+          kwNumber: fullKW.replace(/\s+/g, "").toUpperCase(),
+          viewType,
+          fetchedAt: new Date().toISOString(),
+          lastEntryDate: lastEntry,
+          sadRejonowy: dataWithSettings.sadRejonowy,
+          propertyType: dataWithSettings.dzial1O.propertyType,
+          ownerNames: dataWithSettings.dzial2.owners.map(o => o.name),
+          data: dataWithSettings,
+          rawApify: parsed.raw
+        };
+        addToCache(cacheEntry);
+        setCachedBooks(getCachedBooks());
         setSimulatedResult(dataWithSettings);
-        onDataLoaded(dataWithSettings);
+        onDataLoaded(dataWithSettings, parsed.raw);
         setStep("success");
       } else {
         throw new Error(parsed.error || "Nie udało się pobrać danych z EKW.");
@@ -371,6 +471,84 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
                 </button>
               </div>
             </form>
+
+            {/* Cached KW library */}
+            {cachedBooks.length > 0 && (
+              <div className="space-y-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setShowLibrary(!showLibrary)}
+                  className="w-full flex items-center justify-between text-[9px] font-bold text-[#7A7772] uppercase tracking-[0.2em] cursor-pointer hover:text-[#1A1A1A] transition-colors"
+                >
+                  <span className="flex items-center gap-1.5">
+                    <BookOpen className="w-3.5 h-3.5" />
+                    Biblioteka pobranych KW ({cachedBooks.length})
+                  </span>
+                  <span className="text-[9px]">{showLibrary ? "▲ Zwiń" : "▼ Rozwiń"}</span>
+                </button>
+
+                {showLibrary && (
+                  <div className="space-y-2 max-h-[300px] overflow-y-auto">
+                    {cachedBooks.map((cached) => {
+                      const fetchDate = new Date(cached.fetchedAt);
+                      const ageHours = Math.round((Date.now() - fetchDate.getTime()) / 3600000);
+                      const ageStr = ageHours < 1 ? "< 1h temu" : ageHours < 24 ? `${ageHours}h temu` : `${Math.round(ageHours / 24)}d temu`;
+                      const propLabel = cached.propertyType === "dzialka" ? "Grunt" : cached.propertyType === "lokal" ? "Lokal" : cached.propertyType === "budynek" ? "Budynek" : "Inne";
+
+                      return (
+                        <div
+                          key={`${cached.kwNumber}-${cached.viewType}`}
+                          className="bg-white border border-[#D1CEC8] p-3 hover:border-[#1A1A1A] transition-all group"
+                        >
+                          <div className="flex items-start justify-between gap-2">
+                            <button
+                              type="button"
+                              onClick={() => loadFromCache(cached)}
+                              className="flex-1 text-left cursor-pointer"
+                            >
+                              <div className="flex items-center gap-2">
+                                <span className="font-mono font-bold text-xs text-[#1A1A1A]">{cached.kwNumber}</span>
+                                <span className={`text-[8px] uppercase font-bold tracking-wider px-1.5 py-0.5 ${
+                                  cached.viewType === "zupelna" ? "bg-[#1A1A1A] text-white" : "bg-[#F5F2ED] text-[#7A7772] border border-[#D1CEC8]"
+                                }`}>
+                                  {cached.viewType === "zupelna" ? "Zupełna" : "Aktualna"}
+                                </span>
+                              </div>
+                              <div className="text-[10px] text-[#7A7772] mt-1 font-serif italic">{cached.sadRejonowy}</div>
+                              <div className="flex items-center gap-3 mt-1 text-[9px] text-[#7A7772]">
+                                <span className="font-bold uppercase">{propLabel}</span>
+                                <span>·</span>
+                                <span>{cached.ownerNames.length > 0 ? cached.ownerNames[0] : "—"}{cached.ownerNames.length > 1 ? ` +${cached.ownerNames.length - 1}` : ""}</span>
+                              </div>
+                              <div className="flex items-center gap-3 mt-1.5 text-[9px]">
+                                <span className="flex items-center gap-1 text-[#7A7772]">
+                                  <Clock className="w-2.5 h-2.5" /> Pobrano: {ageStr}
+                                </span>
+                                {cached.lastEntryDate && (
+                                  <span className="text-[#7A7772]">
+                                    Ost. wpis: {cached.lastEntryDate}
+                                  </span>
+                                )}
+                              </div>
+                            </button>
+                            <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                              <button
+                                type="button"
+                                onClick={() => handleDeleteCached(cached.kwNumber, cached.viewType)}
+                                className="p-1.5 text-[#7A7772] hover:text-red-700 transition-colors cursor-pointer"
+                                title="Usuń z biblioteki"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* Quick selectors for Polish Notaries demo cases */}
             <div className="space-y-2 pt-2">
