@@ -1,0 +1,220 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import React, { useState } from "react";
+import { Scale, FileText, ClipboardPen, HelpCircle, Loader2, Sparkles, Building2, Gavel } from "lucide-react";
+import ManualPaster from "./components/ManualPaster";
+import EKWBrowserSim from "./components/EKWBrowserSim";
+import NotaryEditor from "./components/NotaryEditor";
+import EKWHelp from "./components/EKWHelp";
+import { KWData } from "./types";
+
+type ActiveTab = "paste" | "sim" | "help";
+
+export default function App() {
+  const [activeTab, setActiveTab] = useState<ActiveTab>("sim");
+  const [isLoading, setIsLoading] = useState(false);
+  const [loadingFact, setLoadingFact] = useState("Inicjowanie modelu językowego...");
+
+  // Parsed land register documents cache
+  const [parsedResult, setParsedResult] = useState<{
+    structured: KWData;
+    drafts: { classic: string; modern: string; short: string };
+  } | null>(null);
+
+  // Legal facts listed during loader screens to calm the user
+  const legalFacts = [
+    "Dział I-O obejmuje oznaczenie nieruchomości oraz spis spraw, w tym położenie, adres oraz numery działek.",
+    "Dział I-Sp ujawnia prawa splecione z własnością, w tym należne udziały w nieruchomości wspólnej.",
+    "Dział II identyfikuje uprawnionych właścicieli, wielkości ich udziałów oraz podstawy nabycia.",
+    "Dział III zawiera wpisy dotyczące ograniczonych praw rzeczowych, roszczeń i ograniczeń w rozporządzaniu.",
+    "Dział IV przeznaczony jest wyłącznie dla wpisów dotyczących hipotek umownych oraz przymusowych.",
+    "Wzmianki o wnioskach notarialnych w księdze blokują rękojmię wiary publicznej ksiąg wieczystych."
+  ];
+
+  const handleStartLoading = () => {
+    setIsLoading(true);
+    // Shuffle a random fact to show on loading
+    const randomFact = legalFacts[Math.floor(Math.random() * legalFacts.length)];
+    setLoadingFact(randomFact);
+  };
+
+  const handleStopLoading = () => {
+    setIsLoading(false);
+  };
+
+  const handleSimulationDataLoaded = (data: KWData) => {
+    // Since simulation returns the structured JSON, we quickly build corresponding standard drafts
+    const nameStr = data.dzial2.owners.map((o) => `${o.name} (${o.share})`).join(" oraz ");
+    const typeStr = data.dzial1O.propertyType === "lokal" ? "lokal wyodrębniony" : "dzialka";
+    
+    setParsedResult({
+      structured: data,
+      drafts: {
+        classic: `Z księgi wieczystej numer ${data.kwNumber} prowadzonej przez ${data.sadRejonowy}, ${data.wydzialKw}, wynika, że: w Dziale I-O wpisana jest nieruchomość stanowiąca ${typeStr} o powierzchni ${data.dzial1O.totalAreaStr}, położona w m. ${data.dzial1O.location}. W dziale II jako właściciel ujawniony jest: ${nameStr} na podstawie ${data.dzial2.owners[0]?.basisOfAcquisition || "dostępnych podstaw nabycia"}. Dział III ${data.dzial3.hasEntries ? "zawiera wpisy obciążeń/ostrzeżeń" : "nie zawiera wpisów"}. Dział IV ${data.dzial4.hasEntries ? `zawiera zabezpieczenie hipoteczne w kwocie ${data.dzial4.mortgages[0]?.amount.toLocaleString()} ${data.dzial4.mortgages[0]?.currency} na rzecz ${data.dzial4.mortgages[0]?.creditor}` : "jest wolny od wpisów (brak hipotek)"}.`,
+        modern: `Stan prawny nieruchomości o numerze KW ${data.kwNumber} (${data.sadRejonowy}):\n\n1. Oznaczenie nieruchomości: ${data.dzial1O.location}, powierzchni ${data.dzial1O.totalAreaStr}.\n2. Własność: Ujawniono właścicieli: ${nameStr}.\n3. Obciążenia: Działy III i IV wykazują status obciążeń we właściwych rubrykach.`,
+        short: `Księga nr ${data.kwNumber}: ${typeStr}, powierzchnia ${data.dzial1O.totalAreaStr}. Właściciele: ${data.dzial2.owners.map(o => o.name).join(", ")}. Obciążenia: ${data.dzial4.hasEntries ? "Hipoteka aktywna" : "Brak"}.`
+      }
+    });
+  };
+
+  const handleBackToSelect = () => {
+    setParsedResult(null);
+  };
+
+  return (
+    <div className="min-h-screen bg-[#F5F2ED] text-[#1A1A1A] flex flex-col font-sans selection:bg-[#1A1A1A] selection:text-[#F5F2ED]">
+      
+      {/* Top Professional Navigation Navbar Header */}
+      <header className="border-b border-[#D1CEC8] px-4 sm:px-8 py-4 flex justify-between items-center bg-white sticky top-0 z-40 shadow-sm">
+        <div className="max-w-7xl mx-auto w-full flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="w-8 h-8 bg-[#1A1A1A] flex items-center justify-center text-white font-serif font-bold italic tracking-tighter">
+              L
+            </div>
+            <div>
+              <h1 className="text-xs uppercase tracking-[0.2em] font-bold text-[#1A1A1A]">
+                LexParser <span className="text-[#7A7772] font-medium">KW - Notariusz.AI</span>
+              </h1>
+              <p className="text-[9px] uppercase tracking-wider text-[#7A7772] font-semibold mt-0.5">
+                System Opracowania Ksiąg Wieczystych RP
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-6">
+            <div className="hidden md:flex flex-col items-end">
+              <span className="text-[9px] uppercase text-[#7A7772] font-bold tracking-widest">Kancelaria Notarialna</span>
+              <span className="text-xs font-serif italic text-[#1A1A1A]">Pulpit Nowego Aktu</span>
+            </div>
+            <span className="hidden sm:inline-flex items-center gap-1.5 text-[10px] uppercase font-bold tracking-wider text-[#7A7772] bg-[#F5F2ED] border border-[#D1CEC8] px-2.5 py-1">
+              Ustawa o KW i hipotece
+            </span>
+          </div>
+        </div>
+      </header>
+
+      {/* Main Container Layout */}
+      <main className="flex-1 max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 w-full flex flex-col justify-center">
+        
+        {isLoading && (
+          <div className="bg-white border border-[#D1CEC8] p-12 text-center shadow-lg max-w-xl mx-auto w-full my-auto space-y-6 fade-in rounded-none">
+            <div className="flex justify-center">
+              <div className="relative">
+                <div className="w-12 h-12 border border-t-2 border-[#1A1A1A] border-t-transparent animate-spin rounded-full" />
+                <Sparkles className="w-4 h-4 text-[#7A7772] absolute top-4 left-4" />
+              </div>
+            </div>
+            <div className="space-y-2">
+              <h3 className="text-lg font-serif italic text-[#1A1A1A]">
+                Analiza księgi i budowanie draftu...
+              </h3>
+              <p className="text-xs text-[#7A7772] max-w-xs mx-auto leading-relaxed font-serif">
+                Zautomatyzowany parser dopasowuje ułamki, wylicza sumy i uzgadnia powiązane prawa według reguł kancelaryjnych.
+              </p>
+            </div>
+            
+            {/* Fact board widget */}
+            <div className="bg-[#F5F2ED] border border-[#D1CEC8] p-5 text-left rounded-none">
+              <span className="text-[9px] font-bold text-[#7A7772] uppercase block tracking-widest mb-2 font-mono">
+                Zasady Notarialne EKW
+              </span>
+              <p className="text-xs font-serif italic text-[#1A1A1A] leading-relaxed">
+                "{loadingFact}"
+              </p>
+            </div>
+          </div>
+        )}
+
+        {!isLoading && !parsedResult && (
+          <div className="space-y-8 flex-1 flex flex-col justify-center">
+            
+            {/* Header intro card info */}
+            <div className="text-center space-y-3 max-w-2xl mx-auto pb-4">
+              <span className="text-[10px] uppercase font-bold tracking-[0.25em] text-[#7A7772] block">DOKUMENTACJA REPERTORIUM</span>
+              <h2 className="text-2xl sm:text-3.5xl font-serif italic text-[#1A1A1A] tracking-tight leading-tight">
+                Generuj Sprawozdania i Opisy Ksiąg Wieczystych
+              </h2>
+              <p className="text-xs sm:text-sm text-[#7A7772] leading-relaxed max-w-xl mx-auto font-serif">
+                Wklej treść odpisu pobraną z portalu EKW lub skorzystaj z profesjonalnego symulatora. System wygeneruje gotowy, zweryfikowany pod kątem ustępu opis w ułamku sekundy.
+              </p>
+            </div>
+
+            {/* Workplace selectors for source selection */}
+            <div className="flex justify-center border-b border-[#D1CEC8] max-w-lg mx-auto w-full mb-2">
+              <div className="flex gap-1 w-full">
+                <button
+                  onClick={() => setActiveTab("sim")}
+                  className={`flex-1 py-3 text-center border-b-2 text-xs uppercase tracking-widest font-bold flex items-center justify-center gap-2 transition-all cursor-pointer ${
+                    activeTab === "sim"
+                      ? "border-[#1A1A1A] text-[#1A1A1A] bg-white/40"
+                      : "border-transparent text-[#7A7772] hover:text-[#1A1A1A]"
+                  }`}
+                >
+                  <Building2 className="w-3.5 h-3.5" />
+                  Wyszukiwarka EKW
+                </button>
+                <button
+                  onClick={() => setActiveTab("help")}
+                  className={`flex-1 py-3 text-center border-b-2 text-xs uppercase tracking-widest font-bold flex items-center justify-center gap-2 transition-all cursor-pointer ${
+                    activeTab === "help"
+                      ? "border-[#1A1A1A] text-[#1A1A1A] bg-white/40"
+                      : "border-transparent text-[#7A7772] hover:text-[#1A1A1A]"
+                  }`}
+                >
+                  <HelpCircle className="w-3.5 h-3.5" />
+                  Instrukcja
+                </button>
+              </div>
+            </div>
+
+            {/* Rendering matching work tabs */}
+            <div className="flex-1">
+              {activeTab === "sim" && (
+                <EKWBrowserSim
+                  onDataLoaded={handleSimulationDataLoaded}
+                  onStartLoading={handleStartLoading}
+                  onStopLoading={handleStopLoading}
+                />
+              )}
+
+              {activeTab === "help" && <EKWHelp />}
+            </div>
+          </div>
+        )}
+
+        {/* WORKSTATION VIEW: Renders after parsing EKW data details */}
+        {!isLoading && parsedResult && (
+          <div className="fade-in space-y-6">
+            <div className="flex items-center gap-2 text-[10px] uppercase font-bold tracking-[0.25em] text-[#7A7772]">
+              <Scale className="w-4 h-4 text-[#1A1A1A]" /> Obszar Roboczy Nowego Opisu Aktu Notarialnego
+            </div>
+            <NotaryEditor
+              initialData={parsedResult.structured}
+              initialDrafts={parsedResult.drafts}
+              onReimport={handleBackToSelect}
+            />
+          </div>
+        )}
+
+      </main>
+
+      {/* Footer bar styled simple, with strict privacy info */}
+      <footer className="border-t border-[#D1CEC8] bg-[#FDFCFB]">
+        <div className="max-w-7xl mx-auto px-4 sm:px-8 py-4 flex flex-col md:flex-row items-center justify-between text-[10px] uppercase tracking-widest text-[#7A7772] gap-3">
+          <div className="flex items-center gap-2">
+            <span>© 2026 LexParser.</span>
+            <span>Bezpieczne przetwarzanie pamięciowe (Stateless Proxy).</span>
+          </div>
+          <div className="flex gap-5 items-center">
+            <span>Zgodność z RODO / Kancelaria RP</span>
+            <span className="w-2 h-2 rounded-full bg-emerald-600 inline-block"></span>
+          </div>
+        </div>
+      </footer>
+
+    </div>
+  );
+}

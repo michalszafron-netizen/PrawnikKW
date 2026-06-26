@@ -1,0 +1,6 @@
+{
+  "name": "Generator Opisu Księgi Wieczystej z EKW",
+  "description": "Profesjonalne narzędzie dla notariuszy i asystentów do automatycznego generowania opisów ksiąg wieczystych (KW) do aktów notarialnych na podstawie danych z EKW.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
