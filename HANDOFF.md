@@ -30,7 +30,9 @@ Rubryki (RubricViewer) = osobny, WIERNY podgląd surowego rawApify (nie przez pa
 - `aktualna` — „spłaszczona", inne etykiety; wartość bywa **PIERWSZYM** segmentem przed „| Nr podstawy wpisu" (`firstSeg`). Wielu właścicieli/hipotek skondensowanych.
 - Flaga: `const isAktualna = (raw.viewType||"").toLowerCase()==="aktualna"`.
 
-**Wersjonowanie parsera:** `PARSER_VERSION` w `server.ts` MUSI równać się `MIN_PARSER_VERSION` w `src/components/EKWBrowserSim.tsx`. Po każdej zmianie logiki `mapApifyToKWData` podbij OBIE (teraz: **8**). Klient przy otwarciu z biblioteki sam przemapowuje stare wpisy przez `/api/remap-kw`.
+**Wersjonowanie parsera:** `PARSER_VERSION` w `server.ts` MUSI równać się `MIN_PARSER_VERSION` w `src/components/EKWBrowserSim.tsx`. Po każdej zmianie logiki `mapApifyToKWData` podbij OBIE (teraz: **9**). Klient przy otwarciu z biblioteki sam przemapowuje stare wpisy przez `/api/remap-kw`.
+
+**Trwałość (biblioteka + licznik zapytań):** od teraz **po stronie serwera** — plik `kw_store.json` (gitignored, zawiera dane ksiąg). Endpointy: `GET/POST /api/library`, `POST /api/library/delete`, `POST /api/library/bulk`, `GET /api/usage`, `POST /api/usage/increment`. Frontend (`EKWBrowserSim`) ładuje z serwera na mount, mirroruje do `localStorage`, migruje stary `localStorage` → serwer jednorazowo. Dzięki temu czyszczenie cache przeglądarki NIE kasuje już biblioteki ani licznika.
 
 **Autorytatywny numer KW:** `mapApifyToKWData` używa `raw.kwNumber` z Apify (poprawna cyfra kontrolna), nie tego co wpisał user. Zmienna `effectiveKwNumber`.
 

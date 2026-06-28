@@ -9,3 +9,4 @@ coverage/
 apify_raw_*.json
 apify_dumps/
 pobrane_ksiegi/
+kw_store.json

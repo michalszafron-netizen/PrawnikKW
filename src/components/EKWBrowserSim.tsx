@@ -89,6 +89,26 @@ function incrementQueryCount(): number {
   return count;
 }
 
+// --- Server persistence client (library + usage survive browser cache clears) ---
+async function apiGetLibrary(): Promise<CachedKW[] | null> {
+  try { const r = await fetch("/api/library"); if (!r.ok) return null; const j = await r.json(); return Array.isArray(j.books) ? j.books : []; } catch { return null; }
+}
+async function apiSaveBook(book: CachedKW): Promise<CachedKW[] | null> {
+  try { const r = await fetch("/api/library", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ book }) }); if (!r.ok) return null; const j = await r.json(); return Array.isArray(j.books) ? j.books : null; } catch { return null; }
+}
+async function apiDeleteBook(kwNumber: string, viewType: string): Promise<CachedKW[] | null> {
+  try { const r = await fetch("/api/library/delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kwNumber, viewType }) }); if (!r.ok) return null; const j = await r.json(); return Array.isArray(j.books) ? j.books : null; } catch { return null; }
+}
+async function apiBulkLibrary(books: CachedKW[]): Promise<CachedKW[] | null> {
+  try { const r = await fetch("/api/library/bulk", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ books }) }); if (!r.ok) return null; const j = await r.json(); return Array.isArray(j.books) ? j.books : null; } catch { return null; }
+}
+async function apiGetUsage(): Promise<number | null> {
+  try { const r = await fetch("/api/usage"); if (!r.ok) return null; const j = await r.json(); return typeof j.count === "number" ? j.count : null; } catch { return null; }
+}
+async function apiIncrementUsage(): Promise<number | null> {
+  try { const r = await fetch("/api/usage/increment", { method: "POST" }); if (!r.ok) return null; const j = await r.json(); return typeof j.count === "number" ? j.count : null; } catch { return null; }
+}
+
 // --- EKW check-digit validation -------------------------------------------------
 // Official land-register check digit: over (courtCode + 8-digit number), each
 // character is mapped to a value (digits 0-9; letters per the table below),
@@ -189,9 +209,24 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
   const [showLibrary, setShowLibrary] = useState(!!autoOpenLibrary && getCachedBooks().length > 0);
   const [queryCount, setQueryCount] = useState<number>(getQueryCount());
 
-  // One-time local realignment of cached KW numbers to their authoritative value.
+  // Load library + usage from the server (source of truth), migrating any
+  // localStorage data on first run. Falls back to localStorage if server is down.
   useEffect(() => {
-    setCachedBooks(migrateCachedBooks());
+    (async () => {
+      const local = migrateCachedBooks(); // legacy local cache (realigned numbers)
+      let serverBooks = await apiGetLibrary();
+      if (serverBooks === null) {
+        setCachedBooks(local); // server unreachable — show local
+      } else {
+        if (serverBooks.length === 0 && local.length > 0) {
+          serverBooks = (await apiBulkLibrary(local)) || local;
+        }
+        setCachedBooks(serverBooks);
+        saveCachedBooks(serverBooks); // mirror locally
+      }
+      const usage = await apiGetUsage();
+      if (usage !== null) setQueryCount(usage);
+    })();
   }, []);
 
   // Auto compile current book number
@@ -221,6 +256,7 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
             validation
           };
           addToCache(updatedEntry);
+          await apiSaveBook(updatedEntry);
           setCachedBooks(getCachedBooks());
         }
       } catch {
@@ -250,9 +286,10 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
     setStep("success");
   };
 
-  const handleDeleteCached = (kwNumber: string, vt: string) => {
+  const handleDeleteCached = async (kwNumber: string, vt: string) => {
     removeFromCache(kwNumber, vt);
-    setCachedBooks(getCachedBooks());
+    const books = await apiDeleteBook(kwNumber, vt);
+    setCachedBooks(books || getCachedBooks());
   };
 
   // Re-fetch a cached księga from Apify (counts as a billable query) and overwrite
@@ -429,9 +466,12 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
           validation
         };
         addToCache(cacheEntry);
-        setCachedBooks(getCachedBooks());
-        // Count this as one real (billable) EKW fetch.
-        setQueryCount(incrementQueryCount());
+        // Persist to the server (survives browser cache clears); fall back to local.
+        const savedBooks = await apiSaveBook(cacheEntry);
+        setCachedBooks(savedBooks || getCachedBooks());
+        // Count this as one real (billable) EKW fetch — server-side counter.
+        const newCount = await apiIncrementUsage();
+        setQueryCount(newCount !== null ? newCount : incrementQueryCount());
         setSimulatedResult(dataWithSettings);
         onDataLoaded(dataWithSettings, parsed.raw, validation);
         setStep("success");

@@ -972,6 +972,42 @@ function issuesTouch(issues: string[], section: "owners" | "mortgages" | "locati
   return false;
 }
 
+// ---- Server-side persistence (library + usage counter) ------------------------
+// The notary's saved books and monthly EKW query counter live here, on disk, so
+// they survive browser cache clears (previously they were only in localStorage).
+// File holds księga data (incl. PII) — gitignored.
+const STORE_PATH = path.join(process.cwd(), "kw_store.json");
+
+interface KwStore {
+  library: any[];
+  usage: { month: string; count: number };
+}
+
+function readStore(): KwStore {
+  try {
+    if (fs.existsSync(STORE_PATH)) {
+      const s = JSON.parse(fs.readFileSync(STORE_PATH, "utf-8"));
+      return { library: Array.isArray(s.library) ? s.library : [], usage: s.usage || { month: "", count: 0 } };
+    }
+  } catch (e: any) {
+    console.error("[store] read error:", e.message);
+  }
+  return { library: [], usage: { month: "", count: 0 } };
+}
+
+function writeStore(s: KwStore) {
+  try {
+    fs.writeFileSync(STORE_PATH, JSON.stringify(s), "utf-8");
+  } catch (e: any) {
+    console.error("[store] write error:", e.message);
+  }
+}
+
+function storeMonthKey(): string {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+}
+
 async function startServer() {
   const app = express();
   const PORT = parseInt(process.env.PORT || "3000", 10);
@@ -1620,6 +1656,68 @@ Odpowiedz WYŁĄCZNIE obiektem JSON:
       console.error("[Apify] Fetch error:", error.message);
       res.status(500).json({ error: "Błąd połączenia z Apify: " + error.message });
     }
+  });
+
+  // ---- Library + usage persistence API (server-side, survives browser clears) --
+  app.get("/api/library", (_req, res) => {
+    res.json({ books: readStore().library });
+  });
+
+  app.post("/api/library", (req, res) => {
+    const { book } = req.body as { book?: any };
+    if (!book || !book.kwNumber || !book.viewType) {
+      return res.status(400).json({ error: "Brak danych księgi." });
+    }
+    const store = readStore();
+    const idx = store.library.findIndex(
+      (b) => b.kwNumber === book.kwNumber && b.viewType === book.viewType
+    );
+    if (idx >= 0) store.library[idx] = book;
+    else store.library.unshift(book);
+    writeStore(store);
+    res.json({ books: store.library });
+  });
+
+  app.post("/api/library/delete", (req, res) => {
+    const { kwNumber, viewType } = req.body as { kwNumber?: string; viewType?: string };
+    const store = readStore();
+    store.library = store.library.filter(
+      (b) => !(b.kwNumber === kwNumber && b.viewType === viewType)
+    );
+    writeStore(store);
+    res.json({ books: store.library });
+  });
+
+  // Merge a batch of books (one-time localStorage → server migration).
+  app.post("/api/library/bulk", (req, res) => {
+    const { books } = req.body as { books?: any[] };
+    if (!Array.isArray(books)) return res.status(400).json({ error: "Brak listy ksiąg." });
+    const store = readStore();
+    const key = (b: any) => `${b.kwNumber}|${b.viewType}`;
+    const have = new Set(store.library.map(key));
+    for (const b of books) {
+      if (b && b.kwNumber && b.viewType && !have.has(key(b))) {
+        store.library.push(b);
+        have.add(key(b));
+      }
+    }
+    writeStore(store);
+    res.json({ books: store.library });
+  });
+
+  app.get("/api/usage", (_req, res) => {
+    const store = readStore();
+    const month = storeMonthKey();
+    res.json({ month, count: store.usage.month === month ? store.usage.count : 0 });
+  });
+
+  app.post("/api/usage/increment", (_req, res) => {
+    const store = readStore();
+    const month = storeMonthKey();
+    const count = (store.usage.month === month ? store.usage.count : 0) + 1;
+    store.usage = { month, count };
+    writeStore(store);
+    res.json({ month, count });
   });
 
   // Re-run the mapper over an already-fetched raw Apify payload (e.g. one stored
