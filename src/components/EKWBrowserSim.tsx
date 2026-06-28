@@ -4,7 +4,7 @@
  */
 
 import React, { useState, useEffect } from "react";
-import { Search, Server, Shield, Smartphone, ArrowRight, Check, AlertCircle, RefreshCw, Layers, Settings2, BookOpen, Trash2, Clock, Download } from "lucide-react";
+import { Search, Server, Shield, Smartphone, ArrowRight, Check, AlertCircle, RefreshCw, Layers, Settings2, BookOpen, Trash2, Clock, Download, Pencil } from "lucide-react";
 import { PRECONFIGURED_EXAMPLES } from "../data/examples";
 import { KWData } from "../types";
 
@@ -17,6 +17,7 @@ interface ValidationInfo {
 interface CachedKW {
   kwNumber: string;
   viewType: "aktualna" | "zupelna";
+  customName?: string;
   fetchedAt: string;
   lastEntryDate: string;
   sadRejonowy: string;
@@ -206,8 +207,11 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
 
   // Library state
   const [cachedBooks, setCachedBooks] = useState<CachedKW[]>(getCachedBooks());
-  const [showLibrary, setShowLibrary] = useState(!!autoOpenLibrary && getCachedBooks().length > 0);
+  const [showLibrary, setShowLibrary] = useState(true);
   const [queryCount, setQueryCount] = useState<number>(getQueryCount());
+  // Inline rename state for library entries: "kwNumber|viewType" being edited.
+  const [editingKey, setEditingKey] = useState<string | null>(null);
+  const [nameDraft, setNameDraft] = useState("");
 
   // Load library + usage from the server (source of truth), migrating any
   // localStorage data on first run. Falls back to localStorage if server is down.
@@ -290,6 +294,17 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
     removeFromCache(kwNumber, vt);
     const books = await apiDeleteBook(kwNumber, vt);
     setCachedBooks(books || getCachedBooks());
+  };
+
+  // Save a custom, user-defined name for a library entry (e.g. "Mieszkanie Jana
+  // Kowalskiego"). Persisted server-side + local mirror.
+  const saveCachedName = async (cached: CachedKW, name: string) => {
+    const updated: CachedKW = { ...cached, customName: name.trim() || undefined };
+    addToCache(updated);
+    const books = await apiSaveBook(updated);
+    setCachedBooks(books || getCachedBooks());
+    setEditingKey(null);
+    setNameDraft("");
   };
 
   // Re-fetch a cached księga from Apify (counts as a billable query) and overwrite
@@ -452,9 +467,12 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
         // digit), not necessarily what the user typed.
         const authoritativeKW = (dataWithSettings.kwNumber || kwToFetch).replace(/\s+/g, "").toUpperCase();
         const validation: ValidationInfo | undefined = parsed.validation;
+        // Preserve a user-given name across refreshes.
+        const existingNamed = cachedBooks.find(b => b.kwNumber === authoritativeKW && b.viewType === viewToFetch);
         const cacheEntry: CachedKW = {
           kwNumber: authoritativeKW,
           viewType: viewToFetch,
+          customName: existingNamed?.customName,
           fetchedAt: new Date().toISOString(),
           lastEntryDate: lastEntry,
           sadRejonowy: dataWithSettings.sadRejonowy,
@@ -715,7 +733,7 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
                 </button>
 
                 {showLibrary && (
-                  <div className="space-y-2 max-h-[300px] overflow-y-auto">
+                <div className="space-y-2 max-h-[460px] overflow-y-auto pr-1">
                     {cachedBooks.map((cached) => {
                       const fetchDate = new Date(cached.fetchedAt);
                       const ageHours = Math.round((Date.now() - fetchDate.getTime()) / 3600000);
@@ -723,6 +741,7 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
                       const ageDays = (Date.now() - fetchDate.getTime()) / 86400000;
                       const isStale = ageDays >= STALE_AFTER_DAYS;
                       const propLabel = cached.propertyType === "dzialka" ? "Grunt" : cached.propertyType === "lokal" ? "Lokal" : cached.propertyType === "budynek" ? "Budynek" : "Inne";
+                      const entryKey = `${cached.kwNumber}|${cached.viewType}`;
 
                       return (
                         <div
@@ -737,6 +756,11 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
                               onClick={() => loadFromCache(cached)}
                               className="flex-1 text-left cursor-pointer"
                             >
+                              {cached.customName && (
+                                <div className="font-serif font-bold text-sm text-[#1A1A1A] mb-0.5 leading-tight">
+                                  {cached.customName}
+                                </div>
+                              )}
                               <div className="flex items-center gap-2">
                                 <span className="font-mono font-bold text-xs text-[#1A1A1A]">{cached.kwNumber}</span>
                                 <span className={`text-[8px] uppercase font-bold tracking-wider px-1.5 py-0.5 ${
@@ -765,6 +789,14 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
                             <div className="flex gap-1">
                               <button
                                 type="button"
+                                onClick={() => { setEditingKey(entryKey); setNameDraft(cached.customName || ""); }}
+                                className="p-1.5 text-[#7A7772] hover:text-[#1A1A1A] transition-colors cursor-pointer"
+                                title="Nadaj / zmień nazwę"
+                              >
+                                <Pencil className="w-3.5 h-3.5" />
+                              </button>
+                              <button
+                                type="button"
                                 onClick={() => refreshCached(cached)}
                                 className="p-1.5 text-[#7A7772] hover:text-[#1A1A1A] transition-colors cursor-pointer"
                                 title="Odśwież — pobierz nową wersję z EKW (zużywa 1 zapytanie)"
@@ -781,6 +813,24 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
                               </button>
                             </div>
                           </div>
+
+                          {editingKey === entryKey && (
+                            <div className="mt-2 flex items-center gap-1.5">
+                              <input
+                                autoFocus
+                                value={nameDraft}
+                                onChange={(e) => setNameDraft(e.target.value)}
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter") saveCachedName(cached, nameDraft);
+                                  if (e.key === "Escape") { setEditingKey(null); setNameDraft(""); }
+                                }}
+                                placeholder="Nazwa, np. Mieszkanie Jana Kowalskiego"
+                                className="flex-1 border border-[#1A1A1A] bg-white px-2 py-1 text-xs font-serif text-[#1A1A1A] focus:outline-none rounded-none"
+                              />
+                              <button type="button" onClick={() => saveCachedName(cached, nameDraft)} className="text-[9px] font-bold uppercase tracking-wider bg-[#1A1A1A] text-white px-2.5 py-1.5 cursor-pointer hover:bg-stone-800">Zapisz</button>
+                              <button type="button" onClick={() => { setEditingKey(null); setNameDraft(""); }} className="text-[9px] font-bold uppercase tracking-wider border border-[#D1CEC8] text-[#7A7772] px-2.5 py-1.5 cursor-pointer hover:border-[#1A1A1A] hover:text-[#1A1A1A]">Anuluj</button>
+                            </div>
+                          )}
 
                           {isStale && (
                             <div className="mt-2 flex items-start gap-1.5 bg-amber-50 border border-amber-300 px-2 py-1.5">
@@ -799,8 +849,9 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
               </div>
             )}
 
-            {/* Quick selectors for Polish Notaries demo cases */}
-            <div className="space-y-2 pt-2">
+            {/* Quick selectors for Polish Notaries demo cases — hidden: library
+                covers real cases and most demo numbers are invalid. */}
+            <div className="hidden space-y-2 pt-2">
               <span className="text-[9px] font-bold text-[#7A7772] uppercase tracking-[0.2em] block">
                 Lub wybierz przykładowe akta demonstracyjne:
               </span>
