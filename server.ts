@@ -24,11 +24,18 @@ function getDeepseekClient(): OpenAI | null {
     }
     deepseekClient = new OpenAI({
       apiKey: key,
-      baseURL: "https://api.deepseek.com",
+      baseURL: process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com",
     });
   }
   return deepseekClient;
 }
+
+// LLM model used for generation/correction. Configurable via env so we can switch
+// models without code changes. Default is DeepSeek's current model
+// "deepseek-v4-flash" (the legacy "deepseek-chat"/"deepseek-reasoner" aliases are
+// scheduled for deprecation on 2026-07-24). Set DEEPSEEK_MODEL=deepseek-v4-pro for
+// the higher-capability variant, or point DEEPSEEK_BASE_URL at another provider.
+const LLM_MODEL = process.env.DEEPSEEK_MODEL || "deepseek-v4-flash";
 
 // Map of standard Polish EKW Court prefixes
 const COURT_MAP: Record<string, { court: string; dept: string }> = {
@@ -58,6 +65,10 @@ const COURT_MAP: Record<string, { court: string; dept: string }> = {
   "KA1Y": { court: "Sąd Rejonowy w Bytomiu", dept: "IV Wydział Ksiąg Wieczystych" }
 };
 
+// Bump whenever mapApifyToKWData() parsing logic changes — used to invalidate
+// stale localStorage cache entries that were mapped with an older parser.
+const PARSER_VERSION = 6;
+
 // Extract the actual data value from Apify's pipe-separated format
 // e.g. "1. | 1 | --- | ŚLĄSKIE" → "ŚLĄSKIE"
 // e.g. "1. | --- | --- | ---" → ""
@@ -68,15 +79,45 @@ function extractVal(rawValue: string): string {
   return (!last || last === "---") ? "" : last;
 }
 
-// Find entry by label pattern and extract the clean value
+// In the "aktualna" (current) EKW view many fields are encoded as
+// "<VALUE> | <Nr podstawy wpisu>", i.e. the real value is the FIRST segment
+// (the opposite of the "zupełna" view, where extractVal()'s last segment wins).
+function firstSeg(rawValue: string): string {
+  if (!rawValue) return "";
+  const first = rawValue.split("|")[0]?.trim();
+  return (!first || first === "---") ? "" : first;
+}
+
+// Find entry by label pattern and extract the clean value.
+// A label can appear multiple times in the same Dział (e.g. "Obszar" shows up once
+// as an empty placeholder near "Odłączenie" and again with the real value near
+// "Przyłączenie") — prefer the first match that actually has a value.
 function findEntry(entries: any[], labelPattern: string | RegExp): string {
   if (!entries || !Array.isArray(entries)) return "";
-  const entry = entries.find((e: any) => {
+  const matches = entries.filter((e: any) => {
     if (e.label === "_header") return false;
     if (typeof labelPattern === "string") return e.label?.toLowerCase().includes(labelPattern.toLowerCase());
     return labelPattern.test(e.label || "");
   });
-  return entry ? extractVal(entry.value) : "";
+  if (matches.length === 0) return "";
+  const nonEmpty = matches.find((e: any) => extractVal(e.value));
+  return extractVal((nonEmpty || matches[0]).value);
+}
+
+// Some "Lp." table rows embed the field name inside `value` instead of `label`
+// (e.g. label "1.", value "1. Identyfikator działki | 1. | 1 | --- | ACTUAL").
+// Match against the field-name prefix of the value and extract the last segment.
+function findEntryByValuePrefix(entries: any[], fieldNamePattern: string | RegExp): string {
+  if (!entries || !Array.isArray(entries)) return "";
+  const matches = entries.filter((e: any) => {
+    if (e.label === "_header") return false;
+    const firstSegment = (e.value || "").split("|")[0].trim().replace(/^\d+\.\s*/, "");
+    if (typeof fieldNamePattern === "string") return firstSegment.toLowerCase().includes(fieldNamePattern.toLowerCase());
+    return fieldNamePattern.test(firstSegment);
+  });
+  if (matches.length === 0) return "";
+  const nonEmpty = matches.find((e: any) => extractVal(e.value));
+  return extractVal((nonEmpty || matches[0]).value);
 }
 
 function findEntryRaw(entries: any[], labelPattern: string | RegExp): string {
@@ -87,6 +128,46 @@ function findEntryRaw(entries: any[], labelPattern: string | RegExp): string {
     return labelPattern.test(e.label || "");
   });
   return entry?.value || "";
+}
+
+// Determine which sub-rubrics of "Rubryka 1.4 - Oznaczenie" actually carry data.
+//
+// The Dział I-O entry list always contains the structural sub-rubric headers
+// (1.4.1 Działka ewidencyjna, 1.4.2 Budynek, 1.4.3 Urządzenie, 1.4.4 Lokal), each
+// either followed by real field entries or by a "Brak wpisu" header. We walk the
+// list, remember the current sub-rubric, and flag it as present once we encounter
+// a non-header entry holding an actual value. This keeps property-type detection
+// driven by content rather than by the mere presence of section labels, so new
+// księgi of any kind classify correctly.
+function detectRubryka14Sections(ioEntries: any[]): {
+  dzialka: boolean;
+  budynek: boolean;
+  urzadzenie: boolean;
+  lokal: boolean;
+} {
+  const present = { dzialka: false, budynek: false, urzadzenie: false, lokal: false };
+  if (!Array.isArray(ioEntries)) return present;
+
+  let section: keyof typeof present | "" = "";
+  for (const e of ioEntries) {
+    const value = e?.value || "";
+    if (e?.label === "_header") {
+      const v = value.toLowerCase();
+      if (/podrubryka\s*1\.4\.1/.test(v) || /działka ewidencyjna/.test(v)) { section = "dzialka"; continue; }
+      if (/podrubryka\s*1\.4\.2/.test(v) || /\bbudynek\b/.test(v)) { section = "budynek"; continue; }
+      if (/podrubryka\s*1\.4\.3/.test(v) || /\burządzenie\b/.test(v)) { section = "urzadzenie"; continue; }
+      if (/podrubryka\s*1\.4\.4/.test(v) || /\blokal\b/.test(v)) { section = "lokal"; continue; }
+      // Leaving Rubryka 1.4 entirely (1.5+ or any other top-level rubryka) stops tracking.
+      if (/rubryka\s*1\.[5-9]/.test(v) || (!/rubryka\s*1\.4\b/.test(v) && /rubryka\s*\d/.test(v))) {
+        section = "";
+      }
+      // "Brak wpisu" / "-" separators keep the section but carry no data.
+      continue;
+    }
+    // A real field row inside a tracked sub-rubric means that sub-rubric has data.
+    if (section && extractVal(value)) present[section] = true;
+  }
+  return present;
 }
 
 function mapApifyToKWData(raw: any, kwNumber: string, courtInfo: { court: string; dept: string }) {
@@ -102,6 +183,10 @@ function mapApifyToKWData(raw: any, kwNumber: string, courtInfo: { court: string
   const iiiEntries: any[] = dzialIII.entries || [];
   const ivEntries: any[] = dzialIV.entries || [];
 
+  // The two EKW views ("zupełna" = full history, "aktualna" = current state) use
+  // noticeably different field encodings. We branch on this where they diverge.
+  const isAktualna = (raw.viewType || "").toLowerCase() === "aktualna";
+
   // ======================== DZIAŁ I-O ========================
   const wojewodztwo = findEntry(ioEntries, "województwo");
   const powiat = findEntry(ioEntries, "powiat");
@@ -115,10 +200,13 @@ function mapApifyToKWData(raw: any, kwNumber: string, courtInfo: { court: string
     ? locationParts.join(", ")
     : extractVal(findEntryRaw(ioEntries, "położenie")) || "";
 
-  const plotNumber = findEntry(ioEntries, "numer działki");
-  const plotIdentifier = findEntry(ioEntries, "identyfikator działki");
-  const obrebNumer = findEntry(ioEntries, /numer obrębu|obręb ewidencyjny/);
-  const obrebNazwa = findEntry(ioEntries, /nazwa obrębu/);
+  const plotNumber = isAktualna
+    ? (firstSeg(findEntryRaw(ioEntries, "numer działki")) || findEntry(ioEntries, "numer działki"))
+    : findEntry(ioEntries, "numer działki");
+  const plotIdentifier = findEntry(ioEntries, "identyfikator działki") ||
+    findEntryByValuePrefix(ioEntries, "identyfikator działki");
+  const obrebNumer = findEntry(ioEntries, /obręb ewidencyjny/) || findEntryByValuePrefix(ioEntries, "numer obrębu");
+  const obrebNazwa = findEntry(ioEntries, /nazwa obrębu/) || findEntryByValuePrefix(ioEntries, "nazwa obrębu");
   const obreb = [obrebNumer, obrebNazwa].filter(Boolean).join(" ");
   const usageRaw = findEntry(ioEntries, "sposób korzystania");
   const buildingPurpose = findEntry(ioEntries, "przeznaczenie budynku");
@@ -135,8 +223,10 @@ function mapApifyToKWData(raw: any, kwNumber: string, courtInfo: { court: string
   const joinArea = joinAreaEntry ? extractVal(joinAreaEntry.value) : "";
   const joinSeparation = joinKW ? `${joinKW}${joinArea ? ` (${joinArea})` : ""}` : "";
 
-  // Area — from Rubryka 1.5
-  const areaRaw = findEntry(ioEntries, /^\d*\.?\s*obszar$/i) || findEntry(ioEntries, "obszar");
+  // Area — from Rubryka 1.5 (zupełna) or "Obszar całej nieruchomości" (aktualna).
+  const areaRaw = isAktualna
+    ? (firstSeg(findEntryRaw(ioEntries, "obszar")) || findEntry(ioEntries, "obszar"))
+    : (findEntry(ioEntries, /^\d*\.?\s*obszar$/i) || findEntry(ioEntries, "obszar"));
   let areaSqm = 0;
   const areaMatchM2 = areaRaw.match(/([\d\s.,]+)\s*M2/i);
   const areaMatchHA = areaRaw.match(/([\d,.]+)\s*HA/i);
@@ -157,13 +247,28 @@ function mapApifyToKWData(raw: any, kwNumber: string, courtInfo: { court: string
     landUse: usageRaw || ""
   }] : [];
 
-  // Property type detection
+  // Property type detection.
+  //
+  // IMPORTANT: we must NOT rely on the mere presence of the word "lokal"/"budynek"
+  // in the raw text — EVERY księga's Rubryka 1.4 contains the *structural* sub-rubric
+  // headers "Podrubryka 1.4.1 - Działka ewidencyjna", "1.4.2 - Budynek",
+  // "1.4.4 - Lokal" even when they hold "Brak wpisu". Detecting on those words
+  // misclassified every property as a "lokal".
+  //
+  // Instead we inspect which sub-rubric of Rubryka 1.4 actually carries data
+  // (i.e. has non-header field entries before the next sub-rubric header). This is
+  // resilient to future księgi of any kind (działka / budynek / lokal / urządzenie).
   const rawPropType = (raw.propertyType || "").toLowerCase();
-  const ioRawLower = (dzialIO.rawText || "").toLowerCase();
-  let propertyType: "lokal" | "dzialka" | "budynek" | "inne" = "inne";
-  if (rawPropType.includes("lokal") || ioRawLower.includes("lokal")) propertyType = "lokal";
-  else if (rawPropType.includes("grunt") || usageRaw || plotNumber) propertyType = "dzialka";
-  else if (rawPropType.includes("budyn") || ioRawLower.includes("budyn")) propertyType = "budynek";
+  const section14Present = detectRubryka14Sections(ioEntries);
+
+  let propertyType: "lokal" | "dzialka" | "budynek" | "inne";
+  if (section14Present.lokal) propertyType = "lokal";
+  else if (section14Present.budynek) propertyType = "budynek";
+  else if (section14Present.dzialka || plotNumber || usageRaw) propertyType = "dzialka";
+  else if (rawPropType.includes("lokal")) propertyType = "lokal";
+  else if (rawPropType.includes("budyn")) propertyType = "budynek";
+  else if (rawPropType.includes("grunt") || rawPropType.includes("dział")) propertyType = "dzialka";
+  else propertyType = "inne";
 
   const description = [buildingPurpose, usageRaw].filter(Boolean).join(". ") || "";
 
@@ -227,7 +332,9 @@ function mapApifyToKWData(raw: any, kwNumber: string, courtInfo: { court: string
   for (const entry of iiEntries) {
     if (entry.label !== "_header" && /wskazanie podstawy/i.test(entry.value || "")) {
       const val = extractVal(entry.value);
-      if (val) basisText = val;
+      // The "aktualna" view appends a descriptive note like "(wskazanie podstawy)"
+      // to the value — strip it for a clean basis string.
+      if (val) basisText = val.replace(/\s*\((?:wskazanie podstawy|inna podstawa)\)\s*$/i, "").trim();
     }
   }
 
@@ -311,6 +418,68 @@ function mapApifyToKWData(raw: any, kwNumber: string, courtInfo: { court: string
     }
   }
 
+  // Fallback for the "aktualna" (current) view, where Dział II is condensed:
+  // owners appear as a single comma-separated value next to a descriptive label
+  // (e.g. "Osoba fizyczna (Imię ... PESEL)" → "JAN KOWALSKI, OJCIEC, MATKA, PESEL")
+  // rather than as per-field rows. Runs only if the per-field parser found nothing.
+  if (owners.length === 0 && !dzialII.empty) {
+    // Share lives in "Lista wskazań udziałów..." e.g. value "Lp. 1. | 1 | 1 /1 | --- | 2".
+    let condShare = "";
+    const shareEntry = iiEntries.find((e: any) =>
+      /lista wskazań udziałów|wielkość udziału/i.test(e.label || "")
+    );
+    if (shareEntry) {
+      const m = (shareEntry.value || "").match(/(\d+)\s*\/\s*(\d+)/);
+      if (m) condShare = `${m[1]}/${m[2]}`;
+    }
+
+    const titleCase = (s: string) => s ? s.charAt(0).toUpperCase() + s.slice(1).toLowerCase() : "";
+
+    for (const e of iiEntries) {
+      const label = e.label || "";
+      if (label === "_header") continue;
+      const rawValue = e.value || "";
+
+      // Natural person: "IMIĘ1 IMIĘ2 NAZWISKO, imię ojca, imię matki, PESEL"
+      if (/osoba fizyczna/i.test(label)) {
+        const parts = rawValue.split(",").map((s: string) => s.trim()).filter(Boolean);
+        if (parts.length === 0) continue;
+        const fullName = parts[0] || "";
+        const pesel = parts.find((p: string) => /^\d{11}$/.test(p)) || "";
+        const middle = parts.slice(1).filter((p: string) => !/^\d{11}$/.test(p));
+        const father = middle[0] || "";
+        const mother = middle[1] || "";
+        const parentsStr = father || mother
+          ? `syn/córka ${titleCase(father)}${father && mother ? " i " : ""}${titleCase(mother)}`
+          : "";
+        owners.push({
+          id: `own-${owners.length}`,
+          name: fullName.toUpperCase(),
+          peselOrRegon: pesel,
+          parentsNames: parentsStr,
+          share: condShare || "brak danych",
+          basisOfAcquisition: basisText || ""
+        });
+      }
+      // Legal entity: "NAZWA, SIEDZIBA, REGON" (REGON optional)
+      else if (/osoba prawna|jednostka samorz|skarb państwa|niebędąca osobą prawną/i.test(label)) {
+        const parts = rawValue.split(",").map((s: string) => s.trim()).filter(Boolean);
+        const name = parts[0] || "";
+        const regon = parts.find((p: string) => /^\d{9,14}$/.test(p)) || "";
+        if (name) {
+          owners.push({
+            id: `own-${owners.length}`,
+            name: name.toUpperCase(),
+            peselOrRegon: regon ? `REGON: ${regon}` : "",
+            parentsNames: parts[1] && !/^\d{9,14}$/.test(parts[1]) ? `siedziba: ${parts[1]}` : "",
+            share: condShare || "brak danych",
+            basisOfAcquisition: basisText || ""
+          });
+        }
+      }
+    }
+  }
+
   if (owners.length === 0 && !dzialII.empty) {
     owners.push({
       id: "own-0",
@@ -378,21 +547,45 @@ function mapApifyToKWData(raw: any, kwNumber: string, courtInfo: { court: string
   const mortgages: any[] = [];
   const ivNotices: string[] = [];
 
-  // Parse wzmianki in Dział IV (Rubryka 4.1)
+  // Parse wzmianki in Dział IV (Rubryka 4.1).
+  //
+  // A wzmianka that already carries a "Chwila wykreślenia" has been removed and no
+  // longer suspends the public-faith warranty — surfacing it as an active caution
+  // would be a false alarm. We therefore buffer each wzmianka and only keep the
+  // ones that have NOT been wykreślone.
   let inIVWzmianki = false;
-  let currentWzmiankaDesc = "";
+  let wzNumer = "";
+  let wzOpis = "";
+  let wzWykreslona = false;
+  const flushWzmianka = () => {
+    if (wzOpis && !wzWykreslona) {
+      ivNotices.push(`${wzOpis}${wzNumer ? ` (${wzNumer})` : ""}`);
+    }
+    wzNumer = "";
+    wzOpis = "";
+    wzWykreslona = false;
+  };
   for (const e of ivEntries) {
     if (e.label === "_header" && /rubryka 4\.1.*wzmianki/i.test(e.value || "")) { inIVWzmianki = true; continue; }
-    if (e.label === "_header" && /rubryka 4\.[2-9]/i.test(e.value || "")) { inIVWzmianki = false; continue; }
-    if (inIVWzmianki && e.label !== "_header" && !/brak wpisu/i.test(e.value || "")) {
-      if (/numer wzmianki/i.test(e.label || "")) {
-        currentWzmiankaDesc = extractVal(e.value);
-      }
-      if (/opis wzmianki/i.test(e.label || "")) {
-        ivNotices.push(`${e.value}${currentWzmiankaDesc ? ` (${currentWzmiankaDesc})` : ""}`);
-      }
+    if (e.label === "_header" && /rubryka 4\.[2-9]/i.test(e.value || "")) {
+      if (inIVWzmianki) flushWzmianka();
+      inIVWzmianki = false;
+      continue;
+    }
+    if (!inIVWzmianki || e.label === "_header") continue;
+    if (/brak wpisu/i.test(e.value || "")) continue;
+
+    if (/numer wzmianki/i.test(e.value || "")) {
+      // Start of a new wzmianka — finalize the previous one first.
+      flushWzmianka();
+      wzNumer = extractVal(e.value);
+    } else if (/opis wzmianki/i.test(e.label || "")) {
+      wzOpis = extractVal(e.value);
+    } else if (/chwila wykreślenia/i.test(e.label || "")) {
+      if (extractVal(e.value)) wzWykreslona = true;
     }
   }
+  flushWzmianka();
 
   // Parse mortgages — split by "Rubryka 4.2 - Numer hipoteki" headers
   let currentMortgage: any = null;
@@ -492,6 +685,75 @@ function mapApifyToKWData(raw: any, kwNumber: string, courtInfo: { court: string
 
   if (currentMortgage && currentMortgage.type) {
     mortgages.push(currentMortgage);
+  }
+
+  // Fallback for the "aktualna" (current) view: Dział IV is condensed and has no
+  // "Rubryka 4.2" headers. Each mortgage is delimited by a "Lp. N." marker, the
+  // sum/words/currency live in one combined field, and the creditor is a single
+  // comma-separated value. Runs only if the standard parser found nothing.
+  if (mortgages.length === 0 && !dzialIV.empty) {
+    let cur: any = null;
+    const pushCur = () => {
+      if (cur && (cur.type || cur.amount)) mortgages.push(cur);
+    };
+    for (const e of ivEntries) {
+      const label = (e.label || "").trim();
+      const rawValue = e.value || "";
+
+      // New mortgage block starts at a "Lp. N." marker referencing "Nr podstawy wpisu".
+      if (/^Lp\.\s*\d+\.?$/i.test(label) && /nr podstawy wpisu/i.test(rawValue)) {
+        pushCur();
+        cur = {
+          id: `mort-${mortgages.length}`,
+          type: "", amount: 0, currency: "PLN", creditor: "",
+          creditorCity: "", creditorRegon: "", securesWhat: "",
+          sumInWords: "", coEncumberedKW: "", entryNumber: ""
+        };
+        continue;
+      }
+      if (!cur || e.label === "_header") continue;
+
+      if (/^numer hipoteki/i.test(label)) {
+        cur.entryNumber = firstSeg(rawValue);
+      } else if (/^rodzaj hipoteki/i.test(label)) {
+        cur.type = rawValue.trim();
+      } else if (/^suma/i.test(label)) {
+        // "23 330,55 (DWADZIEŚCIA ... 55/100) ZŁ"
+        const amtMatch = rawValue.match(/^([\d\s\u00A0.,]+?)\s*\(/);
+        if (amtMatch) {
+          cur.amount = parseFloat(amtMatch[1].replace(/[\s\u00A0]/g, "").replace(",", "."));
+        }
+        const wordsMatch = rawValue.match(/\(([^)]*)\)/);
+        if (wordsMatch) cur.sumInWords = wordsMatch[1];
+        const curTok = (rawValue.match(/\)\s*([A-ZŁa-zł]{2,3})\s*$/)?.[1] || "").toUpperCase();
+        cur.currency = curTok.includes("EUR") ? "EUR" : curTok.includes("USD") ? "USD" : curTok.includes("CHF") ? "CHF" : "PLN";
+      } else if (/wierzytelność i stosunek prawny/i.test(label)) {
+        const segs = rawValue.split("|").map((s: string) => s.trim());
+        const last = segs[segs.length - 1];
+        if (last && last !== "---") cur.securesWhat = last;
+      } else if (/księga współobciążona/i.test(label)) {
+        const segs = rawValue.split("|").map((s: string) => s.trim());
+        const last = segs[segs.length - 1];
+        if (last && /\//.test(last)) cur.coEncumberedKW = last.replace(/\s+/g, "");
+      } else if (/inna osoba prawna|osoba prawna|jednostka samorz|skarb państwa|niebędąca osobą prawną/i.test(label)) {
+        // Creditor (entity): "Lp. 1. | NAZWA, SIEDZIBA, REGON"
+        const after = rawValue.includes("|") ? rawValue.split("|").slice(1).join("|").trim() : rawValue.trim();
+        const parts = after.split(",").map((s: string) => s.trim()).filter(Boolean);
+        if (parts.length) {
+          cur.creditor = parts[0];
+          const regon = parts.find((p: string) => /^\d{9,14}$/.test(p));
+          const city = parts.slice(1).find((p: string) => !/^\d{9,14}$/.test(p));
+          if (city) cur.creditorCity = city;
+          if (regon) cur.creditorRegon = regon;
+        }
+      } else if (/osoba fizyczna/i.test(label)) {
+        // Creditor (natural person)
+        const after = rawValue.includes("|") ? rawValue.split("|").slice(1).join("|").trim() : rawValue.trim();
+        const parts = after.split(",").map((s: string) => s.trim()).filter(Boolean);
+        if (parts.length) cur.creditor = parts[0];
+      }
+    }
+    pushCur();
   }
 
   // Format creditor strings
@@ -703,7 +965,7 @@ Odpowiedz WYŁĄCZNIE obiektem JSON o następującej strukturze (bez komentarzy,
 }`;
 
       const response = await client.chat.completions.create({
-        model: "deepseek-chat",
+        model: LLM_MODEL,
         response_format: { type: "json_object" },
         messages: [
           { role: "system", content: SIMULATION_SYSTEM_INSTRUCTION },
@@ -834,7 +1096,7 @@ Odpowiedz WYŁĄCZNIE obiektem JSON (bez markdown, bez komentarzy) o następują
 }`;
 
       const response = await client.chat.completions.create({
-        model: "deepseek-chat",
+        model: LLM_MODEL,
         response_format: { type: "json_object" },
         messages: [
           { role: "system", content: GENERATION_SYSTEM_INSTRUCTION },
@@ -849,6 +1111,160 @@ Odpowiedz WYŁĄCZNIE obiektem JSON (bez markdown, bez komentarzy) o następują
     } catch (error: any) {
       console.error("Deepseek Raw Parse error:", error);
       res.status(500).json({ error: "Błąd podczas analizowania tekstu przez model AI: " + error.message });
+    }
+  });
+
+  // API Route: Refine existing drafts with a free-text notarial instruction.
+  //
+  // Unlike /api/parse-raw-text (which re-parses raw EKW text), this endpoint takes
+  // the THREE already-generated drafts plus a natural-language instruction and
+  // returns a corrected set of the same three styles. The structured data is sent
+  // only as factual grounding so the model does not invent or drop facts.
+  app.post("/api/refine-drafts", async (req, res) => {
+    const { instruction, drafts, draft, style, data } = req.body as {
+      instruction?: string;
+      drafts?: { classic?: string; modern?: string; short?: string };
+      draft?: string;
+      style?: "classic" | "modern" | "short" | "custom";
+      data?: any;
+    };
+
+    if (!instruction || !instruction.trim()) {
+      return res.status(400).json({ error: "Brak instrukcji korekty." });
+    }
+
+    const client = getDeepseekClient();
+    if (!client) {
+      return res.status(503).json({
+        error:
+          "Korekta AI wymaga skonfigurowanego klucza DEEPSEEK_API_KEY. Bez niego dostępne są tylko teksty generowane deterministycznie.",
+      });
+    }
+
+    const styleNames: Record<string, string> = {
+      classic: "tradycyjny aktowy (formalny, pełne formuły)",
+      modern: "współczesny (czytelny, punktowany)",
+      short: "skrócony (skondensowany)",
+    };
+
+    // Compact factual grounding — keep the prompt small so the model is fast and
+    // never invents/drops legal facts.
+    const facts = data
+      ? {
+          kwNumber: data.kwNumber,
+          sad: [data.sadRejonowy, data.wydzialKw].filter(Boolean).join(", "),
+          wlasciciele: (data.dzial2?.owners || []).map((o: any) => ({
+            imie: o.name, udzial: o.share, pesel: o.peselOrRegon,
+          })),
+          dzial3: data.dzial3?.hasEntries ? "są wpisy" : "brak",
+          hipoteki: (data.dzial4?.mortgages || []).map((m: any) => ({
+            rodzaj: m.type, kwota: m.amount, waluta: m.currency, wierzyciel: m.creditor,
+          })),
+        }
+      : null;
+
+    const commonRules = `Zasady:
+- Zastosuj instrukcję do tekstu, zachowując jego charakter.
+- NIE zmieniaj faktów prawnych (numery KW, nazwiska, PESEL, kwoty, udziały, liczba hipotek) — chyba że instrukcja wyraźnie tego dotyczy.
+- Tekst to zwykły tekst (plain text) wklejany do aktu — bez Markdown i bez HTML.
+- Zwróć tylko poprawiony tekst, bez komentarzy.`;
+
+    try {
+      // Single-style refinement (fast path — refines only the visible draft).
+      if (typeof draft === "string" && style) {
+        let prompt: string;
+
+        if (style === "custom") {
+          // "From scratch" mode: build a brand-new text purely from the księga data
+          // according to the user's instruction. Full structured data is provided
+          // so the model has every fact it might need.
+          prompt = `Jesteś doświadczonym polskim notariuszem. Na podstawie danych z księgi wieczystej (poniżej) stwórz tekst DOKŁADNIE według polecenia użytkownika.
+
+DANE KSIĘGI WIECZYSTEJ (JSON):
+${JSON.stringify(data ?? {}, null, 0)}
+${draft && draft.trim() ? `\nDOTYCHCZASOWY TEKST (kontynuuj/uwzględnij, jeśli zgodne z poleceniem):\n"""\n${draft}\n"""\n` : ""}
+POLECENIE UŻYTKOWNIKA:
+"${instruction}"
+
+Zasady:
+- Korzystaj wyłącznie z podanych danych — nie wymyślaj faktów ani nie pomijaj istotnych obciążeń, chyba że polecenie wyraźnie tak stanowi.
+- Tekst to zwykły tekst (plain text) wklejany do aktu — bez Markdown i bez HTML.
+- Zwróć tylko wygenerowany tekst, bez komentarzy.
+
+Odpowiedz WYŁĄCZNIE obiektem JSON: { "draft": "wygenerowany tekst" }`;
+        } else {
+          prompt = `Popraw poniższy opis stanu prawnego nieruchomości w stylu "${styleNames[style] || style}".
+${facts ? `\nDANE FAKTYCZNE KSIĘGI (tylko do weryfikacji):\n${JSON.stringify(facts)}\n` : ""}
+TEKST DO POPRAWY:
+"""
+${draft}
+"""
+
+INSTRUKCJA OD NOTARIUSZA:
+"${instruction}"
+
+${commonRules}
+
+Odpowiedz WYŁĄCZNIE obiektem JSON: { "draft": "poprawiony tekst" }`;
+        }
+
+        const response = await client.chat.completions.create({
+          model: LLM_MODEL,
+          response_format: { type: "json_object" },
+          messages: [
+            { role: "system", content: GENERATION_SYSTEM_INSTRUCTION },
+            { role: "user", content: prompt },
+          ],
+          temperature: style === "custom" ? 0.5 : 0.3,
+        });
+        const parsed = JSON.parse((response.choices[0].message.content || "{}").trim());
+        return res.json({ draft: parsed.draft ?? draft, style });
+      }
+
+      // Multi-style refinement (refines all three at once).
+      if (!drafts || (!drafts.classic && !drafts.modern && !drafts.short)) {
+        return res.status(400).json({ error: "Brak tekstów do korekty." });
+      }
+      const prompt = `Otrzymujesz TRZY wersje opisu stanu prawnego nieruchomości (style: classic, modern, short) oraz instrukcję korekty od notariusza.
+${facts ? `\nDANE FAKTYCZNE KSIĘGI (tylko do weryfikacji):\n${JSON.stringify(facts)}\n` : ""}
+AKTUALNE TEKSTY:
+[classic]
+${drafts.classic || ""}
+[modern]
+${drafts.modern || ""}
+[short]
+${drafts.short || ""}
+
+INSTRUKCJA OD NOTARIUSZA:
+"${instruction}"
+
+${commonRules}
+- Zastosuj instrukcję do wszystkich trzech stylów, zachowując ich charakter.
+
+Odpowiedz WYŁĄCZNIE obiektem JSON:
+{ "drafts": { "classic": "...", "modern": "...", "short": "..." } }`;
+
+      const response = await client.chat.completions.create({
+        model: LLM_MODEL,
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system", content: GENERATION_SYSTEM_INSTRUCTION },
+          { role: "user", content: prompt },
+        ],
+        temperature: 0.3,
+      });
+      const parsed = JSON.parse((response.choices[0].message.content || "{}").trim());
+      const out = parsed.drafts || parsed;
+      res.json({
+        drafts: {
+          classic: out.classic ?? drafts.classic ?? "",
+          modern: out.modern ?? drafts.modern ?? "",
+          short: out.short ?? drafts.short ?? "",
+        },
+      });
+    } catch (error: any) {
+      console.error("Deepseek Refine error:", error);
+      res.status(500).json({ error: "Błąd korekty AI: " + error.message });
     }
   });
 
@@ -953,8 +1369,12 @@ Odpowiedz WYŁĄCZNIE obiektem JSON (bez markdown, bez komentarzy) o następują
             console.log(`[Apify DEBUG] ${key} => ${JSON.stringify(val).substring(0, 150)}`);
           }
         }
-        // Save full raw response to file for analysis
-        const debugPath = path.join(process.cwd(), `apify_raw_${normalized.replace(/\//g, "_")}.json`);
+        // Save full raw response to file for analysis. Stored in a dedicated
+        // folder, with the view type in the name so "aktualna" and "zupelna" of
+        // the same księga don't overwrite each other.
+        const dumpDir = path.join(process.cwd(), "apify_dumps");
+        fs.mkdirSync(dumpDir, { recursive: true });
+        const debugPath = path.join(dumpDir, `apify_raw_${normalized.replace(/\//g, "_")}_${apifyViewType}.json`);
         fs.writeFileSync(debugPath, JSON.stringify(raw0, null, 2), "utf-8");
         console.log(`[Apify DEBUG] Full raw response saved to: ${debugPath}`);
       }
@@ -970,10 +1390,31 @@ Odpowiedz WYŁĄCZNIE obiektem JSON (bez markdown, bez komentarzy) o następują
       }
 
       const mapped = mapApifyToKWData(raw, normalized, courtInfo);
-      res.json({ mapped, raw });
+      res.json({ mapped, raw, parserVersion: PARSER_VERSION });
     } catch (error: any) {
       console.error("[Apify] Fetch error:", error.message);
       res.status(500).json({ error: "Błąd połączenia z Apify: " + error.message });
+    }
+  });
+
+  // Re-run the mapper over an already-fetched raw Apify payload (e.g. one stored
+  // in a client's localStorage cache). No Apify/government portal call involved —
+  // lets the client pick up parser fixes without re-scraping a book it already has.
+  app.post("/api/remap-kw", (req, res) => {
+    const { raw, kwNumber } = req.body;
+    if (!raw || !kwNumber) {
+      return res.status(400).json({ error: "Brak danych raw lub kwNumber." });
+    }
+    const prefix = kwNumber.replace(/\s+/g, "").toUpperCase().split("/")[0];
+    const courtInfo = COURT_MAP[prefix] || {
+      court: `Sąd Rejonowy dla kodu ${prefix}`,
+      dept: "Wydział Ksiąg Wieczystych"
+    };
+    try {
+      const mapped = mapApifyToKWData(raw, kwNumber, courtInfo);
+      res.json({ mapped, parserVersion: PARSER_VERSION });
+    } catch (error: any) {
+      res.status(500).json({ error: "Błąd mapowania danych: " + error.message });
     }
   });
 

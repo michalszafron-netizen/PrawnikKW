@@ -7,3 +7,5 @@ coverage/
 .env*
 !.env.example
 apify_raw_*.json
+apify_dumps/
+pobrane_ksiegi/

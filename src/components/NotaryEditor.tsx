@@ -21,7 +21,8 @@ import {
   AlertTriangle,
   Shield,
   Scale,
-  Building2
+  Building2,
+  RotateCcw
 } from "lucide-react";
 import {
   KWData,
@@ -35,12 +36,13 @@ import {
   DEFAULT_FIELD_VISIBILITY,
 } from "../types";
 import RubricViewer from "./RubricViewer";
+import { buildDrafts, DraftSet } from "../lib/draftBuilder";
 
 type EditorViewMode = "editor" | "rubrics";
 
 interface NotaryEditorProps {
   initialData: KWData;
-  initialDrafts: { classic: string; modern: string; short: string };
+  initialDrafts: DraftSet;
   rawApify?: any;
   onReimport: () => void;
 }
@@ -166,6 +168,142 @@ function ApplicationDataBlock({ data }: { data?: string }) {
   );
 }
 
+// Small contextual visibility toggle — placed right next to the field group it
+// controls, so it's obvious what it affects (instead of one big global panel).
+function ToggleChip({
+  label,
+  active,
+  onClick,
+}: {
+  label: string;
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`text-[9px] font-bold uppercase tracking-wider px-2 py-0.5 border transition-colors cursor-pointer ${
+        active
+          ? "bg-[#1A1A1A] text-white border-[#1A1A1A]"
+          : "bg-transparent text-[#7A7772] border-[#D1CEC8] hover:border-[#7A7772]"
+      }`}
+    >
+      {active ? "✓ " : "+ "}
+      {label}
+    </button>
+  );
+}
+
+// Ready-to-use AI correction presets, grouped by purpose. Selecting one fills the
+// instruction field (the notary can still tweak it before sending). These are
+// generic — applicable to any akt — so the user rarely needs to type from scratch.
+const AI_CORRECTION_PRESETS: { group: string; items: { label: string; prompt: string }[] }[] = [
+  {
+    group: "Przeredagowanie / długość",
+    items: [
+      { label: "Przeredaguj zwięźlej (zachowaj fakty)", prompt: "Przeredaguj całość zwięźlej, zachowując wszystkie fakty, kwoty i numery." },
+      { label: "Bardziej szczegółowo i formalnie", prompt: "Przeredaguj bardziej szczegółowo i formalnie, w stylu komparycji aktu notarialnego." },
+      { label: "Uprość język (dla klienta)", prompt: "Uprość język tak, aby był zrozumiały dla osoby niebędącej prawnikiem, zachowując wszystkie fakty." },
+    ],
+  },
+  {
+    group: "Hipoteki / Dział IV",
+    items: [
+      { label: "Skonsoliduj hipoteki w jedno zdanie", prompt: "Połącz wszystkie hipoteki w jedno zdanie zbiorcze: liczba hipotek, łączna suma i wierzyciel — bez wymieniania każdej osobno." },
+      { label: "Hipoteki: tylko numer, kwota, wierzyciel", prompt: "Przy hipotekach zostaw wyłącznie numer, kwotę cyfrowo i wierzyciela. Usuń opisy tytułów wierzytelności i okresy składek." },
+      { label: "Usuń opisy tytułów wierzytelności", prompt: "Usuń szczegółowe opisy tytułów wierzytelności (okresy, fundusze), zostaw rodzaj hipoteki, kwotę i wierzyciela." },
+    ],
+  },
+  {
+    group: "Kwoty i liczby",
+    items: [
+      { label: "Kwoty tylko cyfrowo", prompt: "Kwoty zostaw tylko cyfrowo, usuń powtórzony zapis słowny w nawiasach." },
+      { label: "Kwoty również słownie", prompt: "Przy każdej kwocie dodaj w nawiasie pełny zapis słowny." },
+      { label: "Wszystkie liczby słownie", prompt: "Zamień liczby i kwoty na zapis słowny, z wyjątkiem numerów ksiąg wieczystych i numerów działek." },
+    ],
+  },
+  {
+    group: "Dane / RODO",
+    items: [
+      { label: "Zamaskuj PESEL (ostatnie 4 cyfry)", prompt: "Zamaskuj numer PESEL — pokaż tylko ostatnie cztery cyfry, resztę zastąp gwiazdkami." },
+      { label: "Usuń REGON i siedzibę wierzyciela", prompt: "Pomiń REGON oraz siedzibę wierzyciela, zostaw samą nazwę." },
+      { label: "Skróć „Zakład Ubezpieczeń Społecznych” do ZUS", prompt: "Pełną nazwę „Zakład Ubezpieczeń Społecznych” zastąp skrótem ZUS (rozwiń ją tylko przy pierwszym wystąpieniu)." },
+    ],
+  },
+  {
+    group: "Struktura / pomijanie",
+    items: [
+      { label: "Usuń sekcję o wzmiankach", prompt: "Usuń całą sekcję UWAGA dotyczącą wzmianek o wnioskach." },
+      { label: "Pomiń podstawy nabycia i oznaczenia", prompt: "Pomiń informacje o podstawie nabycia oraz podstawie oznaczenia nieruchomości." },
+      { label: "Listę zamień na ciągły akapit", prompt: "Zamień wypunktowaną listę hipotek na ciągły akapit bez numeracji." },
+    ],
+  },
+  {
+    group: "Klauzule / styl",
+    items: [
+      { label: "Dodaj klauzulę o dacie odpisu", prompt: "Dodaj na końcu zdanie: „Stan prawny według odpisu na dzień jego sporządzenia.”" },
+      { label: "Nazwiska wielkimi literami", prompt: "Wszystkie imiona i nazwiska osób zapisz wielkimi literami, pozostały tekst bez zmian." },
+    ],
+  },
+];
+
+// Ready-to-use "from scratch" creation prompts for the custom tab. Selecting one
+// fills the instruction field; the AI then builds a brand-new document from the
+// księga data. Separate from AI_CORRECTION_PRESETS (which tweak existing text).
+const AI_CREATION_PRESETS: { group: string; items: { label: string; prompt: string }[] }[] = [
+  {
+    group: "Dokumenty / fragmenty aktu",
+    items: [
+      {
+        label: "Fragment komparycji aktu (oznaczenie + właściciel)",
+        prompt:
+          "Sporządź fragment komparycji aktu notarialnego: dokładne oznaczenie nieruchomości z Działu I-O oraz właściciela z Działu II (z PESEL i podstawą nabycia). Styl formalny, bez wypunktowań.",
+      },
+      {
+        label: "Opis przedmiotu umowy (do umowy sprzedaży)",
+        prompt:
+          "Przygotuj opis przedmiotu umowy do projektu umowy sprzedaży: oznaczenie nieruchomości, właściciel, udział oraz wzmianka o obciążeniach z Działu III i IV.",
+      },
+      {
+        label: "Oświadczenie o stanie obciążeń dla banku",
+        prompt:
+          "Sporządź zwięzłe oświadczenie o stanie obciążeń hipotecznych nieruchomości na potrzeby banku: numer KW, właściciel, łączna liczba i suma hipotek oraz wierzyciel(e). Maksymalnie kilka zdań.",
+      },
+    ],
+  },
+  {
+    group: "Analizy / notatki",
+    items: [
+      {
+        label: "Notatka due diligence (ryzyka prawne)",
+        prompt:
+          "Przygotuj krótką notatkę due diligence: zidentyfikuj ryzyka prawne wynikające z Działu III i IV (obciążenia, hipoteki, ostrzeżenia) oraz ze wzmianek o wnioskach.",
+      },
+      {
+        label: "Streszczenie stanu prawnego dla klienta",
+        prompt:
+          "Streść stan prawny nieruchomości prostym językiem dla klienta niebędącego prawnikiem: co posiada, jakie są obciążenia i na co zwrócić uwagę.",
+      },
+    ],
+  },
+  {
+    group: "Zestawienia",
+    items: [
+      {
+        label: "Zestawienie hipotek (lista tekstowa)",
+        prompt:
+          "Stwórz przejrzyste zestawienie wszystkich hipotek z Działu IV: dla każdej numer, rodzaj, kwota, wierzyciel i zabezpieczana wierzytelność. Na końcu podaj łączną sumę.",
+      },
+      {
+        label: "Zestawienie działek ewidencyjnych",
+        prompt:
+          "Stwórz zestawienie działek ewidencyjnych z Działu I-O: numer działki, obręb, sposób korzystania i obszar.",
+      },
+    ],
+  },
+];
+
 export default function NotaryEditor({
   initialData,
   initialDrafts,
@@ -181,7 +319,6 @@ export default function NotaryEditor({
   const [fieldVisibility, setFieldVisibility] = useState<FieldVisibilityConfig>(
     DEFAULT_FIELD_VISIBILITY
   );
-  const [showFilters, setShowFilters] = useState(false);
   const [viewMode, setViewMode] = useState<EditorViewMode>("editor");
 
   useEffect(() => {
@@ -207,7 +344,9 @@ export default function NotaryEditor({
       });
       const resData = await response.json();
       if (response.ok) {
-        setDrafts(resData.drafts);
+        // Preserve the user's "custom" draft — the server only returns the three
+        // standard styles.
+        setDrafts((prev) => ({ ...prev, ...resData.drafts }));
       } else {
         throw new Error(resData.error);
       }
@@ -219,48 +358,14 @@ export default function NotaryEditor({
   };
 
   const rebuildDraftsOnClient = () => {
-    const num = data.kwNumber;
-    const court = data.sadRejonowy;
-    const typeStr =
-      data.dzial1O.propertyType === "lokal"
-        ? "lokal stanowiący odrębną własność"
-        : "nieruchomość gruntową";
-    const loc = data.dzial1O.location;
-    const desc = data.dzial1O.description;
-
-    const ownerClauses = data.dzial2.owners
-      .map((o) => {
-        const peselCl = o.peselOrRegon ? ` (PESEL: ${o.peselOrRegon})` : "";
-        const parentsCl = o.parentsNames ? `, ${o.parentsNames},` : "";
-        return `${o.name}${parentsCl}${peselCl} w udziale wynoszącym ${o.share}`;
-      })
-      .join(" oraz ");
-
-    const mortCl =
-      data.dzial4.hasEntries && data.dzial4.mortgages.length > 0
-        ? `nieruchomość jest obciążona: ` +
-          data.dzial4.mortgages
-            .map(
-              (m) =>
-                `${m.type} w wysokości ${m.amount.toLocaleString()} ${m.currency} na rzecz ${m.creditor}`
-            )
-            .join(", ")
-        : "dział IV jest wolny od wpisów (brak zabezpieczeń hipotecznych)";
-
-    const d3text =
-      data.dzial3.hasEntries
-        ? [
-            ...data.dzial3.easements.map((e) => e.description),
-            ...data.dzial3.warningsAndExecutions.map((w) => w.description),
-            ...data.dzial3.otherRights.map((r) => r.description),
-          ].join(". ") || "wpisy ujawnione"
-        : "dział III wolny od wpisów";
-
-    setDrafts({
-      classic: `Z księgi wieczystej numer ${num}, prowadzonej przez ${court}, wynika, iż w Dziale I-O wpisana jest ${typeStr}, położona w: ${loc}, opisana jako: ${desc}. W Dziale I-Sp ujawniono: ${data.dzial1Sp.hasEntries ? data.dzial1Sp.associatedRights.map((r) => r.description).join(". ") : "brak wpisów praw związanych z własnością"}. Jako właściciele w Dziale II wpisani są: ${ownerClauses}, na podstawie podstaw nabycia ujawnionych w księdze. W Dziale III: ${d3text}. W Dziale IV: ${mortCl}. Stan prawny zgodny z aktualnym odpisem z EKW.`,
-      modern: `Stan księgi wieczystej nr ${num} (${court}):\n\n1. Oznaczenie: ${loc}. ${desc}\n2. Prawa związane (I-Sp): ${data.dzial1Sp.hasEntries ? "Ujawnione" : "Brak wpisów"}\n3. Właściciele: ${data.dzial2.owners.map((o) => `${o.name} [udział ${o.share}]`).join(", ")}\n4. Prawa i roszczenia (III): ${d3text}\n5. Hipoteki: ${mortCl}`,
-      short: `KW ${num}: ${typeStr} w m. ${loc}. Właściciele: ${data.dzial2.owners.map((o) => o.name).join(" / ")}. Dział III: ${data.dzial3.hasEntries ? "Wpisy ujawnione" : "Brak wpisów"}. Dział IV: ${data.dzial4.hasEntries ? "Hipoteka wpisana" : "Brak obciążeń"}.`,
-    });
+    setDrafts((prev) => ({
+      ...buildDrafts(data, {
+        includePesels: data.notarySettings?.includePesels ?? true,
+        includeAcquisitionBasis: data.notarySettings?.includeAcquisitionBasis ?? true,
+      }),
+      // The "custom" draft has no generated baseline — keep whatever the user has.
+      custom: prev.custom,
+    }));
   };
 
   const currentDraftText = drafts[activeStyle];
@@ -287,28 +392,50 @@ export default function NotaryEditor({
     e.preventDefault();
     if (!customPrompt.trim()) return;
     setIsUpdatingAI(true);
+
+    // Guard against a hung request: abort with a clear message after 90s instead
+    // of leaving the user with a cryptic "Failed to fetch".
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 90000);
+
     try {
-      const response = await fetch("/api/parse-raw-text", {
+      const response = await fetch("/api/refine-drafts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
         body: JSON.stringify({
-          rawText: `Odpis KW: ${JSON.stringify(data)}\n\nTekst dotychczasowego draftu: ${currentDraftText}`,
-          notarySettings: data.notarySettings,
-          rawTextOverride: `Zmień wygenerowany tekst według instrukcji: "${customPrompt}". Zwróć zaktualizowany zestaw 3 stylów.`,
+          instruction: customPrompt,
+          draft: currentDraftText,
+          style: activeStyle,
+          data,
         }),
       });
       const resData = await response.json();
       if (response.ok) {
-        setDrafts(resData.drafts);
+        setDrafts({ ...drafts, [activeStyle]: resData.draft });
         setCustomPrompt("");
       } else {
-        throw new Error(resData.error);
+        throw new Error(resData.error || `Błąd serwera (${response.status})`);
       }
     } catch (err: any) {
-      alert("Błąd dostosowania AI: " + err.message);
+      const msg =
+        err?.name === "AbortError"
+          ? "Korekta AI trwała zbyt długo i została przerwana. Spróbuj ponownie lub uprość polecenie."
+          : err?.message === "Failed to fetch"
+            ? "Brak połączenia z serwerem korekty. Sprawdź, czy serwer (npm run dev) działa, i spróbuj ponownie."
+            : err?.message || "Nieznany błąd korekty AI.";
+      alert("Błąd dostosowania AI: " + msg);
     } finally {
+      clearTimeout(timeout);
       setIsUpdatingAI(false);
     }
+  };
+
+  // Restore the deterministic, generated drafts (built from the current structured
+  // data) — an escape hatch when an AI correction mangles the text.
+  const handleRestoreDrafts = () => {
+    rebuildDraftsOnClient();
+    setCustomPrompt("");
   };
 
   // --- Mutators ---
@@ -507,22 +634,6 @@ export default function NotaryEditor({
     });
   };
 
-  // --- Filter definitions ---
-  const FILTER_OPTIONS: {
-    key: keyof FieldVisibilityConfig;
-    label: string;
-    shortLabel: string;
-  }[] = [
-    { key: "notices", label: "Wzmianki o wnioskach", shortLabel: "Wzmianki" },
-    { key: "applicationData", label: "Dane o wniosku (nr Dz.Kw.)", shortLabel: "Wnioski" },
-    { key: "pesel", label: "PESEL / REGON", shortLabel: "PESEL" },
-    { key: "basisDocuments", label: "Podstawy wpisu / nabycia", shortLabel: "Podstawy" },
-    { key: "identifiers", label: "Identyfikatory (TERYT, nr bieżący)", shortLabel: "Identyfikatory" },
-    { key: "landUse", label: "Sposób korzystania z działki", shortLabel: "Użytkowanie" },
-    { key: "entryNumbers", label: "Numery bieżące wpisów", shortLabel: "Nr wpisów" },
-    { key: "interestRate", label: "Odsetki / Oprocentowanie", shortLabel: "Odsetki" },
-  ];
-
   const hasAnyNotices =
     (data.dzial1O.notices?.length || 0) > 0 ||
     (data.dzial1Sp.notices?.length || 0) > 0 ||
@@ -531,9 +642,9 @@ export default function NotaryEditor({
     (data.dzial4.notices?.length || 0) > 0;
 
   return (
-    <div className="grid grid-cols-1 xl:grid-cols-12 gap-8 items-stretch">
+    <div className="grid grid-cols-1 xl:grid-cols-12 gap-8 items-stretch xl:h-[calc(100vh-11rem)]">
       {/* LEFT COLUMN: Structural editor */}
-      <div className="xl:col-span-5 flex flex-col gap-4">
+      <div className="xl:col-span-6 flex flex-col gap-4 xl:overflow-y-auto xl:pr-2 custom-scroll">
         <div className="bg-[#FDFCFB] border border-[#D1CEC8] p-5 sm:p-6 shadow-sm space-y-4">
           {/* Header */}
           <div className="flex justify-between items-start pb-3 border-b border-[#E5E5E5]">
@@ -584,47 +695,25 @@ export default function NotaryEditor({
           ) : (
           <>
 
-          {/* Filter bar */}
-          <div className="bg-[#F5F2ED] border border-[#D1CEC8] p-3">
-            <button
-              type="button"
-              onClick={() => setShowFilters(!showFilters)}
-              className="flex items-center gap-2 w-full text-left cursor-pointer"
-            >
-              <Filter className="w-3.5 h-3.5 text-[#7A7772]" />
-              <span className="text-[10px] font-bold text-[#7A7772] uppercase tracking-[0.15em] flex-1">
-                Widoczność rubryk
-              </span>
-              <span className="text-[9px] text-[#7A7772] font-mono">
-                {Object.values(vis).filter(Boolean).length}/{FILTER_OPTIONS.length}
-              </span>
-              {showFilters ? (
-                <ChevronDown className="w-3 h-3 text-[#7A7772]" />
-              ) : (
-                <ChevronRight className="w-3 h-3 text-[#7A7772]" />
-              )}
-            </button>
-
-            {showFilters && (
-              <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1.5 pt-2 border-t border-[#D1CEC8]">
-                {FILTER_OPTIONS.map((opt) => (
-                  <label
-                    key={opt.key}
-                    className="flex items-center gap-2 cursor-pointer group"
-                  >
-                    <input
-                      type="checkbox"
-                      checked={vis[opt.key]}
-                      onChange={() => toggleVis(opt.key)}
-                      className="w-3.5 h-3.5 accent-[#1A1A1A] cursor-pointer"
-                    />
-                    <span className="text-[10px] text-[#1A1A1A] group-hover:text-[#7A7772] transition-colors">
-                      {opt.label}
-                    </span>
-                  </label>
-                ))}
-              </div>
-            )}
+          {/* Global toggles — only for flags that cut across every dział
+              (wzmianki/wnioski already only render where that dział actually
+              has data). Everything else lives as a chip next to the field it
+              controls, further down. */}
+          <div className="bg-[#F5F2ED] border border-[#D1CEC8] p-3 flex items-center gap-2 flex-wrap">
+            <Filter className="w-3.5 h-3.5 text-[#7A7772]" />
+            <span className="text-[9px] font-bold text-[#7A7772] uppercase tracking-wider mr-1">
+              Pokaż w całej księdze:
+            </span>
+            <ToggleChip
+              label="Wzmianki o wnioskach"
+              active={vis.notices}
+              onClick={() => toggleVis("notices")}
+            />
+            <ToggleChip
+              label="Dane o wniosku (nr Dz.Kw.)"
+              active={vis.applicationData}
+              onClick={() => toggleVis("applicationData")}
+            />
           </div>
 
           {hasAnyNotices && (
@@ -680,7 +769,7 @@ export default function NotaryEditor({
                   Typ obiektu
                 </span>
                 <select
-                  value={data.dzial1O.propertyType}
+                  value={data.dzial1O.propertyType || "inne"}
                   onChange={(e) =>
                     setData({
                       ...data,
@@ -730,14 +819,23 @@ export default function NotaryEditor({
               />
             </div>
 
-            {vis.landUse && (
-              <FieldInput
-                label="Sposób korzystania"
-                value=""
-                onChange={() => {}}
-                placeholder="np. grunty orne, tereny mieszkaniowe, lasy..."
+            <div className="flex items-center gap-1.5 flex-wrap pt-1">
+              <ToggleChip
+                label="Podstawa oznaczenia"
+                active={vis.basisDocuments}
+                onClick={() => toggleVis("basisDocuments")}
               />
-            )}
+              <ToggleChip
+                label="Przyłączenie / odłączenie"
+                active={vis.joinSeparation}
+                onClick={() => toggleVis("joinSeparation")}
+              />
+              <ToggleChip
+                label="Identyfikator TERYT"
+                active={vis.identifiers}
+                onClick={() => toggleVis("identifiers")}
+              />
+            </div>
 
             {vis.basisDocuments && data.dzial1O.basisDocuments && (
               <FieldInput
@@ -783,56 +881,58 @@ export default function NotaryEditor({
               {data.dzial1O.plots.map((plot, idx) => (
                 <div
                   key={idx}
-                  className="flex gap-2 items-center bg-[#FDFCFB] border border-[#D1CEC8] p-2"
+                  className="bg-[#FDFCFB] border border-[#D1CEC8] p-2 space-y-1.5"
                 >
-                  <input
-                    type="text"
-                    placeholder="Nr"
-                    value={plot.number}
-                    onChange={(e) => updatePlot(idx, { number: e.target.value })}
-                    className="w-20 border-b border-[#1A1A1A] text-center font-mono font-bold text-xs focus:outline-none"
-                  />
-                  <input
-                    type="number"
-                    placeholder="Pow."
-                    value={plot.areaSquareMeters || ""}
-                    onChange={(e) =>
-                      updatePlot(idx, {
-                        areaSquareMeters: parseInt(e.target.value) || 0,
-                      })
-                    }
-                    className="w-16 border-b border-[#1A1A1A] text-center font-serif text-xs focus:outline-none"
-                  />
-                  <span className="text-[10px] font-serif text-[#7A7772] italic">
-                    m²
-                  </span>
-                  <input
-                    type="text"
-                    placeholder="Obręb"
-                    value={plot.cadastreUnit || ""}
-                    onChange={(e) =>
-                      updatePlot(idx, { cadastreUnit: e.target.value })
-                    }
-                    className="flex-1 min-w-0 border-b border-stone-300 text-xs text-[#7A7772] font-serif focus:outline-none focus:border-[#1A1A1A]"
-                  />
+                  <div className="flex gap-2 items-center">
+                    <input
+                      type="text"
+                      placeholder="Nr"
+                      value={plot.number}
+                      onChange={(e) => updatePlot(idx, { number: e.target.value })}
+                      className="w-20 shrink-0 border-b border-[#1A1A1A] text-center font-mono font-bold text-xs focus:outline-none"
+                    />
+                    <input
+                      type="number"
+                      placeholder="Pow."
+                      value={plot.areaSquareMeters || ""}
+                      onChange={(e) =>
+                        updatePlot(idx, {
+                          areaSquareMeters: parseInt(e.target.value) || 0,
+                        })
+                      }
+                      className="w-16 shrink-0 border-b border-[#1A1A1A] text-center font-serif text-xs focus:outline-none"
+                    />
+                    <span className="text-[10px] font-serif text-[#7A7772] italic shrink-0">
+                      m²
+                    </span>
+                    <input
+                      type="text"
+                      placeholder="Obręb"
+                      value={plot.cadastreUnit || ""}
+                      onChange={(e) =>
+                        updatePlot(idx, { cadastreUnit: e.target.value })
+                      }
+                      className="flex-1 min-w-0 border-b border-stone-300 text-xs text-[#7A7772] font-serif focus:outline-none focus:border-[#1A1A1A]"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => removePlot(idx)}
+                      className="text-red-700 hover:text-red-950 transition-colors p-1 shrink-0"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
                   {vis.identifiers && (
                     <input
                       type="text"
-                      placeholder="ID TERYT"
+                      placeholder="Identyfikator działki (TERYT)"
                       value={plot.identifier || ""}
                       onChange={(e) =>
                         updatePlot(idx, { identifier: e.target.value })
                       }
-                      className="w-24 border-b border-stone-300 text-xs text-[#7A7772] font-mono focus:outline-none focus:border-[#1A1A1A]"
+                      className="w-full border-b border-stone-300 text-[10px] text-[#7A7772] font-mono focus:outline-none focus:border-[#1A1A1A] pt-1"
                     />
                   )}
-                  <button
-                    type="button"
-                    onClick={() => removePlot(idx)}
-                    className="text-red-700 hover:text-red-950 transition-colors p-1"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                  </button>
                 </div>
               ))}
             </div>
@@ -945,6 +1045,24 @@ export default function NotaryEditor({
               >
                 <Plus className="w-3 h-3" /> Dodaj właściciela
               </button>
+            </div>
+
+            <div className="flex items-center gap-1.5 flex-wrap">
+              <ToggleChip
+                label="PESEL / REGON"
+                active={vis.pesel}
+                onClick={() => toggleVis("pesel")}
+              />
+              <ToggleChip
+                label="Podstawa nabycia"
+                active={vis.basisDocuments}
+                onClick={() => toggleVis("basisDocuments")}
+              />
+              <ToggleChip
+                label="Nr i data wpisu"
+                active={vis.entryNumbers}
+                onClick={() => toggleVis("entryNumbers")}
+              />
             </div>
 
             {data.dzial2.owners.map((owner) => (
@@ -1237,6 +1355,19 @@ export default function NotaryEditor({
               </button>
             </div>
 
+            <div className="flex items-center gap-1.5 flex-wrap">
+              <ToggleChip
+                label="Odsetki"
+                active={vis.interestRate}
+                onClick={() => toggleVis("interestRate")}
+              />
+              <ToggleChip
+                label="Nr i data wpisu"
+                active={vis.entryNumbers}
+                onClick={() => toggleVis("entryNumbers")}
+              />
+            </div>
+
             {data.dzial4.mortgages.length === 0 ? (
               <EmptySection label="Dział IV wolny od wpisów (Czysta hipoteka)" />
             ) : (
@@ -1360,7 +1491,7 @@ export default function NotaryEditor({
       </div>
 
       {/* RIGHT COLUMN: Document workstation */}
-      <div className="xl:col-span-7 flex flex-col h-full min-h-[640px]">
+      <div className="xl:col-span-6 flex flex-col h-full min-h-[640px] xl:min-h-0">
         <div className="bg-[#FDFCFB] border border-[#D1CEC8] shadow-sm flex-1 flex flex-col overflow-hidden">
           {/* Style picker */}
           <div className="bg-[#F5F2ED] border-b border-[#D1CEC8] px-6 py-4 flex flex-wrap gap-4 items-center justify-between">
@@ -1370,6 +1501,7 @@ export default function NotaryEditor({
                   ["classic", "Tradycyjny (Aktowy)"],
                   ["modern", "Współczesny"],
                   ["short", "Skrócony"],
+                  ["custom", "Własny (od zera)"],
                 ] as const
               ).map(([key, label]) => (
                 <button
@@ -1387,6 +1519,14 @@ export default function NotaryEditor({
             </div>
 
             <div className="flex items-center gap-3">
+              <button
+                onClick={handleRestoreDrafts}
+                disabled={isUpdatingAI}
+                title="Przywróć pierwotny, wygenerowany tekst (cofa korekty AI i ręczne zmiany)"
+                className="text-[10px] font-bold uppercase tracking-widest border border-[#7A7772] text-[#7A7772] hover:bg-[#7A7772] hover:text-[#F5F2ED] py-2 px-4 transition-all duration-200 cursor-pointer bg-transparent flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                <RotateCcw className="w-3.5 h-3.5" /> Przywróć
+              </button>
               <button
                 onClick={handleCopyToClipboard}
                 className="text-[10px] font-bold uppercase tracking-widest border border-[#1A1A1A] hover:bg-[#1A1A1A] hover:text-[#F5F2ED] py-2 px-4 transition-all duration-200 cursor-pointer bg-transparent text-[#1A1A1A] flex items-center gap-1.5"
@@ -1411,21 +1551,25 @@ export default function NotaryEditor({
           </div>
 
           {/* Paper workspace */}
-          <div className="flex-1 p-6 lg:p-8 bg-[#F5F2ED]/60 relative flex flex-col justify-center">
+          <div className="flex-1 p-5 lg:p-6 bg-[#F5F2ED]/60 relative flex flex-col">
             <div className="text-[9px] font-mono font-bold uppercase tracking-wider text-[#7A7772]/80 absolute top-4 right-6 flex items-center gap-1.5 select-none">
               <FileText className="w-3.5 h-3.5" /> Repertorium A draft
             </div>
 
-            <div className="flex-1 bg-[#FCFBFA] border border-[#D1CEC8] p-6 sm:p-10 shadow-inner flex flex-col min-h-[440px] relative">
-              <div className="absolute left-7 top-0 bottom-0 w-[1px] bg-red-200/50 pointer-events-none" />
-              <div className="flex-1 pl-6 lg:pl-10">
+            <div className="flex-1 bg-[#FCFBFA] border border-[#D1CEC8] p-5 sm:p-7 shadow-inner flex flex-col min-h-[160px] relative overflow-hidden">
+              <div className="absolute left-6 top-0 bottom-0 w-[1px] bg-red-200/50 pointer-events-none" />
+              <div className="flex-1 pl-5 lg:pl-7 overflow-hidden">
                 <textarea
                   value={currentDraftText}
                   onChange={(e) =>
                     setDrafts({ ...drafts, [activeStyle]: e.target.value })
                   }
-                  className="w-full h-full bg-transparent resize-none border-none focus:outline-none text-[#1A1A1A] text-xs sm:text-sm font-serif leading-8 tracking-wide"
-                  placeholder="Tutaj pojawi się gotowy do skopiowania opis aktu notarialnego w wybranym stylu..."
+                  className="w-full h-full bg-transparent resize-none border-none focus:outline-none text-[#222] text-[13px] font-serif leading-[1.65] whitespace-pre-wrap overflow-y-auto custom-scroll"
+                  placeholder={
+                    activeStyle === "custom"
+                      ? "Styl pusty (od zera). W polu na dole opisz, co AI ma stworzyć na podstawie danych księgi — np. „sporządź zwięzłe oświadczenie o stanie obciążeń dla banku”. Możesz też pisać tutaj ręcznie."
+                      : "Tutaj pojawi się gotowy do skopiowania opis aktu notarialnego w wybranym stylu..."
+                  }
                 />
               </div>
               {isUpdatingAI && (
@@ -1440,26 +1584,69 @@ export default function NotaryEditor({
           </div>
 
           {/* AI prompt bar */}
-          <div className="bg-[#F5F2ED] border-t border-[#D1CEC8] px-6 py-5">
-            <form onSubmit={handleCustomRePrompt} className="space-y-2.5">
+          <div className="bg-[#F5F2ED] border-t border-[#D1CEC8] px-5 py-3">
+            <form onSubmit={handleCustomRePrompt} className="space-y-2">
               <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-1.5">
                 <label className="text-[10px] font-bold text-[#7A7772] uppercase tracking-widest flex items-center gap-1.5">
-                  <Sparkles className="w-3.5 h-3.5 text-[#1A1A1A]" /> Korekty
-                  AI (Polecenie Notarialne)
+                  <Sparkles className="w-3.5 h-3.5 text-[#1A1A1A]" />{" "}
+                  {activeStyle === "custom"
+                    ? "Stwórz od zera — opisz, co AI ma napisać"
+                    : "Korekty AI — zmienia wybrany styl"}
                 </label>
                 <span className="text-[9px] text-[#7A7772] font-serif italic">
-                  Np:{" "}
-                  <em className="text-neutral-700">
-                    „zapisz wszystkie nazwiska małą czcionką"
-                  </em>
+                  Wybierz gotowe polecenie lub wpisz własne
                 </span>
               </div>
+              <select
+                value=""
+                disabled={isUpdatingAI}
+                onChange={(e) => {
+                  if (e.target.value) setCustomPrompt(e.target.value);
+                }}
+                className="w-full bg-white border border-[#D1CEC8] px-3 py-1.5 text-xs font-serif text-[#1A1A1A] focus:outline-none focus:border-[#1A1A1A] cursor-pointer shadow-sm disabled:opacity-50"
+              >
+                <option value="">— Gotowe korekty (wybierz, aby wstawić) —</option>
+                {AI_CORRECTION_PRESETS.map((grp) => (
+                  <optgroup key={grp.group} label={grp.group}>
+                    {grp.items.map((it) => (
+                      <option key={it.label} value={it.prompt}>
+                        {it.label}
+                      </option>
+                    ))}
+                  </optgroup>
+                ))}
+              </select>
+              {activeStyle === "custom" && (
+                <select
+                  value=""
+                  disabled={isUpdatingAI}
+                  onChange={(e) => {
+                    if (e.target.value) setCustomPrompt(e.target.value);
+                  }}
+                  className="w-full bg-[#1A1A1A]/[0.03] border border-[#1A1A1A] px-3 py-1.5 text-xs font-serif text-[#1A1A1A] focus:outline-none focus:border-[#1A1A1A] cursor-pointer shadow-sm disabled:opacity-50"
+                >
+                  <option value="">✦ Gotowe dokumenty od zera (wybierz, aby wstawić)</option>
+                  {AI_CREATION_PRESETS.map((grp) => (
+                    <optgroup key={grp.group} label={grp.group}>
+                      {grp.items.map((it) => (
+                        <option key={it.label} value={it.prompt}>
+                          {it.label}
+                        </option>
+                      ))}
+                    </optgroup>
+                  ))}
+                </select>
+              )}
               <div className="flex gap-3">
                 <input
                   type="text"
                   value={customPrompt}
                   onChange={(e) => setCustomPrompt(e.target.value)}
-                  placeholder="Wpisz niestandardową instrukcję, aby dokonać precyzyjnej zmiany w wygenerowanym tekście..."
+                  placeholder={
+                    activeStyle === "custom"
+                      ? "Opisz dokument do stworzenia, np. „przygotuj oświadczenie o obciążeniach hipotecznych dla banku”..."
+                      : "Wpisz instrukcję językową, np. rozpisz udziały słownie albo nazwiska wielkimi literami..."
+                  }
                   className="flex-1 bg-white border-b border-[#1A1A1A] px-3 py-2 text-xs font-serif text-[#1A1A1A] placeholder-[#9E9C98] focus:outline-none focus:border-[#7A7772] shadow-sm"
                 />
                 <button

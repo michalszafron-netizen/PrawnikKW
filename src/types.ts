@@ -122,7 +122,6 @@ export interface FieldVisibilityConfig {
   pesel: boolean;
   basisDocuments: boolean;
   identifiers: boolean;
-  landUse: boolean;
   joinSeparation: boolean;
   entryNumbers: boolean;
   interestRate: boolean;
@@ -134,13 +133,12 @@ export const DEFAULT_FIELD_VISIBILITY: FieldVisibilityConfig = {
   pesel: true,
   basisDocuments: true,
   identifiers: false,
-  landUse: false,
-  joinSeparation: false,
+  joinSeparation: true,
   entryNumbers: false,
   interestRate: false,
 };
 
-export type TemplateStyle = "classic" | "modern" | "short";
+export type TemplateStyle = "classic" | "modern" | "short" | "custom";
 
 export interface PreconfiguredExample {
   id: string;

@@ -106,6 +106,70 @@ function parseRubrics(entries: RubricEntry[]): Rubric[] {
   return rubrics;
 }
 
+// The "aktualna" view has no "Rubryka/Podrubryka" headers — instead it uses plain
+// section captions ("Działki ewidencyjne", "Właściciele", "Wierzyciel hipoteczny",
+// …). Clean a value for faithful display: drop the leading "Lp. N. |" scaffolding
+// and the trailing "| Nr podstawy wpisu" label, and turn remaining pipes into a
+// readable separator.
+function cleanFlatValue(raw: string): string {
+  if (!raw) return "";
+  let v = raw.replace(/^Lp\.\s*\d+\.?\s*\|\s*/i, "");
+  v = v.replace(/\s*\|\s*Nr podstawy wpisu\s*$/i, "");
+  v = v.replace(/\s*\|\s*/g, " · ");
+  return v.trim();
+}
+
+function parseRubricsFlat(entries: RubricEntry[]): Rubric[] {
+  const rubrics: Rubric[] = [];
+  let current: Rubric | null = null;
+  const ensure = (): Rubric => {
+    if (!current) {
+      current = { id: "grp-0", title: "Treść wpisu", entries: [], subrubrics: [] };
+      rubrics.push(current);
+    }
+    return current;
+  };
+
+  for (const entry of entries) {
+    const label = entry.label || "";
+    const val = entry.value || "";
+
+    if (label === "_header") {
+      if (/^DZIAŁ\s/i.test(val) || val === "-" || val === "---" || !val.trim()) continue;
+      if (/^Brak wpisu$/i.test(val)) {
+        ensure().entries.push({ label: "", value: "BRAK WPISU" });
+        continue;
+      }
+      // A long, data-like header (e.g. a "DZ. KW./..." wniosek line) is content,
+      // not a section caption.
+      if (/^DZ\.\s*KW/i.test(val) || val.length > 90) {
+        ensure().entries.push({ label: "", value: cleanFlatValue(val) });
+        continue;
+      }
+      current = { id: `${val}-${rubrics.length}`, title: val, entries: [], subrubrics: [] };
+      rubrics.push(current);
+      continue;
+    }
+
+    // Skip "aktualna" row delimiters ("Lp. N." + "Nr podstawy wpisu") and scaffolding.
+    if (/^Lp\.\s*\d+\.?$/i.test(label.trim()) && /nr podstawy wpisu/i.test(val)) continue;
+    if (label === "Lp." || label === "Wpisu") continue;
+
+    ensure().entries.push({ label, value: cleanFlatValue(val) });
+  }
+
+  return rubrics;
+}
+
+// Pick the right parser based on the data shape (zupełna has Rubryka/Podrubryka
+// headers; aktualna does not).
+function buildRubrics(entries: RubricEntry[]): Rubric[] {
+  const hasRubrykaHeaders = entries.some(
+    (e) => e.label === "_header" && /^(Rubryka|Podrubryka)\s/i.test(e.value || "")
+  );
+  return hasRubrykaHeaders ? parseRubrics(entries) : parseRubricsFlat(entries);
+}
+
 function RubricBlock({
   rubric,
   depth = 0,
@@ -306,7 +370,7 @@ export default function RubricViewer({ rawApify, kwNumber }: RubricViewerProps) 
       icon: cfg.icon,
       empty: raw.empty === true,
       rawText: raw.rawText,
-      rubrics: parseRubrics(raw.entries || []),
+      rubrics: buildRubrics(raw.entries || []),
     };
   });
 

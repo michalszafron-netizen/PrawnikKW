@@ -18,9 +18,15 @@ interface CachedKW {
   ownerNames: string[];
   data: KWData;
   rawApify?: any;
+  parserVersion?: number;
 }
 
 const KW_CACHE_KEY = "lexparser_kw_cache";
+
+// Must match PARSER_VERSION in server.ts. If a cached entry was mapped by an
+// older parser, we re-map it from its stored rawApify (no Apify/network call
+// needed) the next time it's opened from the library — see remapIfStale().
+const MIN_PARSER_VERSION = 6;
 
 function getCachedBooks(): CachedKW[] {
   try {
@@ -46,6 +52,36 @@ function removeFromCache(kwNumber: string, viewType: string) {
   saveCachedBooks(books);
 }
 
+// --- Monthly EKW query counter (per browser profile; no backend) ----------------
+// Apify free tier ≈ 35 fetches/month; the $10 plan ≈ 1000/month. We track real
+// fetches locally so the notary sees how many paid lookups they've used.
+const QUERY_COUNTER_KEY = "lexparser_query_counter";
+const MONTHLY_QUERY_LIMIT = 1000;
+// A cached księga older than this many days triggers a "may be outdated" warning.
+const STALE_AFTER_DAYS = 7;
+
+function currentMonthKey(): string {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+}
+
+function getQueryCount(): number {
+  try {
+    const raw = localStorage.getItem(QUERY_COUNTER_KEY);
+    if (!raw) return 0;
+    const obj = JSON.parse(raw);
+    return obj.month === currentMonthKey() ? (obj.count || 0) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function incrementQueryCount(): number {
+  const count = getQueryCount() + 1;
+  localStorage.setItem(QUERY_COUNTER_KEY, JSON.stringify({ month: currentMonthKey(), count }));
+  return count;
+}
+
 function extractLastEntryDate(data: KWData, rawApify?: any): string {
   if (!rawApify) return "";
   const allSections = [rawApify.dzialIO, rawApify.dzialISp, rawApify.dzialII, rawApify.dzialIII, rawApify.dzialIV].filter(Boolean);
@@ -66,9 +102,10 @@ interface EKWBrowserSimProps {
   onDataLoaded: (data: KWData, rawApify?: any) => void;
   onStartLoading: () => void;
   onStopLoading: () => void;
+  autoOpenLibrary?: boolean;
 }
 
-export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoading }: EKWBrowserSimProps) {
+export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoading, autoOpenLibrary }: EKWBrowserSimProps) {
   // Input states
   const [courtCode, setCourtCode] = useState("WA1M");
   const [bookNumber, setBookNumber] = useState("00348754");
@@ -93,14 +130,42 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
 
   // Library state
   const [cachedBooks, setCachedBooks] = useState<CachedKW[]>(getCachedBooks());
-  const [showLibrary, setShowLibrary] = useState(false);
+  const [showLibrary, setShowLibrary] = useState(!!autoOpenLibrary && getCachedBooks().length > 0);
+  const [queryCount, setQueryCount] = useState<number>(getQueryCount());
 
   // Auto compile current book number
   const fullKW = `${courtCode}/${bookNumber}/${controlNum}`;
 
-  const loadFromCache = (cached: CachedKW) => {
+  const loadFromCache = async (cached: CachedKW) => {
+    let bookData = cached.data;
+
+    // If this entry was mapped by an older parser, re-map it locally from the
+    // rawApify it already carries — no Apify/government portal call needed.
+    if ((cached.parserVersion || 0) < MIN_PARSER_VERSION && cached.rawApify) {
+      try {
+        const remapRes = await fetch("/api/remap-kw", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ raw: cached.rawApify, kwNumber: cached.kwNumber })
+        });
+        const remapped = await remapRes.json();
+        if (remapRes.ok && remapped.mapped) {
+          bookData = remapped.mapped;
+          const updatedEntry: CachedKW = {
+            ...cached,
+            data: bookData,
+            parserVersion: remapped.parserVersion
+          };
+          addToCache(updatedEntry);
+          setCachedBooks(getCachedBooks());
+        }
+      } catch {
+        // Remap failed (e.g. server unreachable) — fall back to the cached mapping as-is.
+      }
+    }
+
     const data: KWData = {
-      ...cached.data,
+      ...bookData,
       notarySettings: {
         includePesels,
         includeAcquisitionBasis,
@@ -124,6 +189,19 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
   const handleDeleteCached = (kwNumber: string, vt: string) => {
     removeFromCache(kwNumber, vt);
     setCachedBooks(getCachedBooks());
+  };
+
+  // Re-fetch a cached księga from Apify (counts as a billable query) and overwrite
+  // the stored entry, even if the data is identical. Used by the "Odśwież" button.
+  const refreshCached = (cached: CachedKW) => {
+    const parts = cached.kwNumber.split("/");
+    if (parts.length === 3) {
+      setCourtCode(parts[0]);
+      setBookNumber(parts[1]);
+      setControlNum(parts[2]);
+    }
+    setViewType(cached.viewType);
+    triggerLookup(cached.kwNumber, cached.viewType);
   };
 
   // Predefined quick select
@@ -153,8 +231,8 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
       return;
     }
 
-    setStep("captcha");
-    setSliderPosition(0);
+    // Skip the CAPTCHA step entirely — go straight to fetching.
+    triggerLookup();
   };
 
   // Drag handles for beautiful Custom Sliding Captcha
@@ -204,7 +282,9 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
     };
   }, [isDragging, sliderPosition]);
 
-  const triggerLookup = () => {
+  const triggerLookup = (kwOverride?: string, viewOverride?: "aktualna" | "zupelna") => {
+    const kwToFetch = (kwOverride || fullKW);
+    const viewToFetch = viewOverride || viewType;
     setStep("loading");
     onStartLoading();
     setLogs([]);
@@ -230,18 +310,18 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
         currentLogIndex++;
       } else {
         clearInterval(interval);
-        completeSearch();
+        completeSearch(kwToFetch, viewToFetch);
       }
     }, 450);
   };
 
-  const completeSearch = async () => {
+  const completeSearch = async (kwToFetch: string, viewToFetch: "aktualna" | "zupelna") => {
     try {
       // Try fetching real data from Apify EKW scraper
       const response = await fetch("/api/fetch-kw", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ kwNumber: fullKW, viewType })
+        body: JSON.stringify({ kwNumber: kwToFetch, viewType: viewToFetch })
       });
       const parsed = await response.json();
 
@@ -258,18 +338,21 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
         };
         const lastEntry = extractLastEntryDate(dataWithSettings, parsed.raw);
         const cacheEntry: CachedKW = {
-          kwNumber: fullKW.replace(/\s+/g, "").toUpperCase(),
-          viewType,
+          kwNumber: kwToFetch.replace(/\s+/g, "").toUpperCase(),
+          viewType: viewToFetch,
           fetchedAt: new Date().toISOString(),
           lastEntryDate: lastEntry,
           sadRejonowy: dataWithSettings.sadRejonowy,
           propertyType: dataWithSettings.dzial1O.propertyType,
           ownerNames: dataWithSettings.dzial2.owners.map(o => o.name),
           data: dataWithSettings,
-          rawApify: parsed.raw
+          rawApify: parsed.raw,
+          parserVersion: parsed.parserVersion || MIN_PARSER_VERSION
         };
         addToCache(cacheEntry);
         setCachedBooks(getCachedBooks());
+        // Count this as one real (billable) EKW fetch.
+        setQueryCount(incrementQueryCount());
         setSimulatedResult(dataWithSettings);
         onDataLoaded(dataWithSettings, parsed.raw);
         setStep("success");
@@ -281,7 +364,7 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
 
       // Fallback: check preconfigured examples
       const matchedEx = PRECONFIGURED_EXAMPLES.find(
-        (e) => e.kwNumber.replace(/\s+/g, "").toUpperCase() === fullKW.replace(/\s+/g, "").toUpperCase()
+        (e) => e.kwNumber.replace(/\s+/g, "").toUpperCase() === kwToFetch.replace(/\s+/g, "").toUpperCase()
       );
 
       if (matchedEx) {
@@ -294,7 +377,7 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
           const simResponse = await fetch("/api/simulate-kw", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ kwNumber: fullKW })
+            body: JSON.stringify({ kwNumber: kwToFetch })
           });
           const simParsed = await simResponse.json();
 
@@ -432,8 +515,10 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
                 </p>
               </div>
 
-              {/* Notary AI parameters */}
-              <div className="border-t border-[#D1CEC8] pt-3 space-y-2">
+              {/* Notary AI parameters — hidden for now: AI extracts everything later,
+                  and these toggles are adjustable on the workstation. Kept in the
+                  DOM (defaults applied) so re-enabling is a one-line change. */}
+              <div className="hidden border-t border-[#D1CEC8] pt-3 space-y-2">
                 <div className="text-[9px] font-bold text-[#7A7772] uppercase tracking-[0.2em] flex items-center gap-1.5">
                   <Settings2 className="w-3 h-3 text-[#1A1A1A]" /> Parametry Opracowania AI
                 </div>
@@ -469,6 +554,29 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
                   <Search className="w-4 h-4 text-[#7A7772] inline-block mr-1" />
                   Rozpocznij Pobieranie z serwerów
                 </button>
+                <div className="mt-3 flex items-center justify-center">
+                  <div className={`inline-flex items-center gap-2 border px-3 py-1.5 ${
+                    queryCount >= MONTHLY_QUERY_LIMIT
+                      ? "bg-red-50 border-red-300"
+                      : queryCount >= MONTHLY_QUERY_LIMIT * 0.9
+                        ? "bg-amber-50 border-amber-300"
+                        : "bg-[#1A1A1A] border-[#1A1A1A]"
+                  }`}>
+                    <Server className={`w-3.5 h-3.5 ${
+                      queryCount >= MONTHLY_QUERY_LIMIT ? "text-red-700" : queryCount >= MONTHLY_QUERY_LIMIT * 0.9 ? "text-amber-700" : "text-white"
+                    }`} />
+                    <span className={`text-[10px] font-bold uppercase tracking-wider ${
+                      queryCount >= MONTHLY_QUERY_LIMIT ? "text-red-700" : queryCount >= MONTHLY_QUERY_LIMIT * 0.9 ? "text-amber-800" : "text-white/70"
+                    }`}>
+                      Zapytania EKW (mies.):
+                    </span>
+                    <span className={`text-xs font-mono font-bold ${
+                      queryCount >= MONTHLY_QUERY_LIMIT ? "text-red-700" : queryCount >= MONTHLY_QUERY_LIMIT * 0.9 ? "text-amber-900" : "text-white"
+                    }`}>
+                      {queryCount} / {MONTHLY_QUERY_LIMIT}
+                    </span>
+                  </div>
+                </div>
               </div>
             </form>
 
@@ -493,12 +601,16 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
                       const fetchDate = new Date(cached.fetchedAt);
                       const ageHours = Math.round((Date.now() - fetchDate.getTime()) / 3600000);
                       const ageStr = ageHours < 1 ? "< 1h temu" : ageHours < 24 ? `${ageHours}h temu` : `${Math.round(ageHours / 24)}d temu`;
+                      const ageDays = (Date.now() - fetchDate.getTime()) / 86400000;
+                      const isStale = ageDays >= STALE_AFTER_DAYS;
                       const propLabel = cached.propertyType === "dzialka" ? "Grunt" : cached.propertyType === "lokal" ? "Lokal" : cached.propertyType === "budynek" ? "Budynek" : "Inne";
 
                       return (
                         <div
                           key={`${cached.kwNumber}-${cached.viewType}`}
-                          className="bg-white border border-[#D1CEC8] p-3 hover:border-[#1A1A1A] transition-all group"
+                          className={`bg-white border p-3 transition-all group ${
+                            isStale ? "border-amber-300 hover:border-amber-500" : "border-[#D1CEC8] hover:border-[#1A1A1A]"
+                          }`}
                         >
                           <div className="flex items-start justify-between gap-2">
                             <button
@@ -509,7 +621,7 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
                               <div className="flex items-center gap-2">
                                 <span className="font-mono font-bold text-xs text-[#1A1A1A]">{cached.kwNumber}</span>
                                 <span className={`text-[8px] uppercase font-bold tracking-wider px-1.5 py-0.5 ${
-                                  cached.viewType === "zupelna" ? "bg-[#1A1A1A] text-white" : "bg-[#F5F2ED] text-[#7A7772] border border-[#D1CEC8]"
+                                  cached.viewType === "zupelna" ? "bg-[#1A1A1A] text-white" : "bg-emerald-600 text-white"
                                 }`}>
                                   {cached.viewType === "zupelna" ? "Zupełna" : "Aktualna"}
                                 </span>
@@ -520,18 +632,26 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
                                 <span>·</span>
                                 <span>{cached.ownerNames.length > 0 ? cached.ownerNames[0] : "—"}{cached.ownerNames.length > 1 ? ` +${cached.ownerNames.length - 1}` : ""}</span>
                               </div>
-                              <div className="flex items-center gap-3 mt-1.5 text-[9px]">
-                                <span className="flex items-center gap-1 text-[#7A7772]">
-                                  <Clock className="w-2.5 h-2.5" /> Pobrano: {ageStr}
+                              <div className="flex items-center gap-3 mt-2 text-[10px]">
+                                <span className={`flex items-center gap-1 font-semibold ${isStale ? "text-amber-700" : "text-[#5A5650]"}`}>
+                                  <Clock className="w-3 h-3" /> Pobrano: <span className="font-bold">{ageStr}</span>
                                 </span>
                                 {cached.lastEntryDate && (
-                                  <span className="text-[#7A7772]">
-                                    Ost. wpis: {cached.lastEntryDate}
+                                  <span className="text-[#5A5650] font-semibold">
+                                    Ost. wpis: <span className="font-bold text-[#1A1A1A]">{cached.lastEntryDate}</span>
                                   </span>
                                 )}
                               </div>
                             </button>
-                            <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                            <div className="flex gap-1">
+                              <button
+                                type="button"
+                                onClick={() => refreshCached(cached)}
+                                className="p-1.5 text-[#7A7772] hover:text-[#1A1A1A] transition-colors cursor-pointer"
+                                title="Odśwież — pobierz nową wersję z EKW (zużywa 1 zapytanie)"
+                              >
+                                <RefreshCw className="w-3.5 h-3.5" />
+                              </button>
                               <button
                                 type="button"
                                 onClick={() => handleDeleteCached(cached.kwNumber, cached.viewType)}
@@ -542,6 +662,16 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
                               </button>
                             </div>
                           </div>
+
+                          {isStale && (
+                            <div className="mt-2 flex items-start gap-1.5 bg-amber-50 border border-amber-300 px-2 py-1.5">
+                              <AlertCircle className="w-3.5 h-3.5 text-amber-700 shrink-0 mt-0.5" />
+                              <span className="text-[9px] text-amber-800 font-bold leading-snug">
+                                Minęło ponad {STALE_AFTER_DAYS} dni od pobrania — dane mogą być nieaktualne.
+                                Kliknij <RefreshCw className="w-2.5 h-2.5 inline-block mx-0.5" />, aby pobrać nową wersję.
+                              </span>
+                            </div>
+                          )}
                         </div>
                       );
                     })}

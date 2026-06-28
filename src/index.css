@@ -29,3 +29,29 @@ body {
   color: #1A1A1A;
 }
 
+
+/* Discreet scrollbar for the structural editor panel */
+.custom-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: #C9C4BC transparent;
+}
+
+.custom-scroll::-webkit-scrollbar {
+  width: 8px;
+}
+
+.custom-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.custom-scroll::-webkit-scrollbar-thumb {
+  background-color: #C9C4BC;
+  border-radius: 4px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+.custom-scroll::-webkit-scrollbar-thumb:hover {
+  background-color: #A8A39B;
+  background-clip: content-box;
+}

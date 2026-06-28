@@ -4,12 +4,13 @@
  */
 
 import React, { useState } from "react";
-import { Scale, FileText, ClipboardPen, HelpCircle, Loader2, Sparkles, Building2, Gavel } from "lucide-react";
+import { Scale, FileText, ClipboardPen, HelpCircle, Loader2, Sparkles, Building2, Gavel, BookOpen } from "lucide-react";
 import ManualPaster from "./components/ManualPaster";
 import EKWBrowserSim from "./components/EKWBrowserSim";
 import NotaryEditor from "./components/NotaryEditor";
 import EKWHelp from "./components/EKWHelp";
 import { KWData } from "./types";
+import { buildDrafts, DraftSet } from "./lib/draftBuilder";
 
 type ActiveTab = "paste" | "sim" | "help";
 
@@ -17,11 +18,12 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<ActiveTab>("sim");
   const [isLoading, setIsLoading] = useState(false);
   const [loadingFact, setLoadingFact] = useState("Inicjowanie modelu językowego...");
+  const [autoOpenLibrary, setAutoOpenLibrary] = useState(false);
 
   // Parsed land register documents cache
   const [parsedResult, setParsedResult] = useState<{
     structured: KWData;
-    drafts: { classic: string; modern: string; short: string };
+    drafts: DraftSet;
     rawApify?: any;
   } | null>(null);
 
@@ -47,22 +49,24 @@ export default function App() {
   };
 
   const handleSimulationDataLoaded = (data: KWData, rawApify?: any) => {
-    // Since simulation returns the structured JSON, we quickly build corresponding standard drafts
-    const nameStr = data.dzial2.owners.map((o) => `${o.name} (${o.share})`).join(" oraz ");
-    const typeStr = data.dzial1O.propertyType === "lokal" ? "lokal wyodrębniony" : "dzialka";
-    
+    // Build all three drafts from the single, shared, data-driven generator.
     setParsedResult({
       structured: data,
       rawApify,
-      drafts: {
-        classic: `Z księgi wieczystej numer ${data.kwNumber} prowadzonej przez ${data.sadRejonowy}, ${data.wydzialKw}, wynika, że: w Dziale I-O wpisana jest nieruchomość stanowiąca ${typeStr} o powierzchni ${data.dzial1O.totalAreaStr}, położona w m. ${data.dzial1O.location}. W dziale II jako właściciel ujawniony jest: ${nameStr} na podstawie ${data.dzial2.owners[0]?.basisOfAcquisition || "dostępnych podstaw nabycia"}. Dział III ${data.dzial3.hasEntries ? "zawiera wpisy obciążeń/ostrzeżeń" : "nie zawiera wpisów"}. Dział IV ${data.dzial4.hasEntries ? `zawiera zabezpieczenie hipoteczne w kwocie ${data.dzial4.mortgages[0]?.amount.toLocaleString()} ${data.dzial4.mortgages[0]?.currency} na rzecz ${data.dzial4.mortgages[0]?.creditor}` : "jest wolny od wpisów (brak hipotek)"}.`,
-        modern: `Stan prawny nieruchomości o numerze KW ${data.kwNumber} (${data.sadRejonowy}):\n\n1. Oznaczenie nieruchomości: ${data.dzial1O.location}, powierzchni ${data.dzial1O.totalAreaStr}.\n2. Własność: Ujawniono właścicieli: ${nameStr}.\n3. Obciążenia: Działy III i IV wykazują status obciążeń we właściwych rubrykach.`,
-        short: `Księga nr ${data.kwNumber}: ${typeStr}, powierzchnia ${data.dzial1O.totalAreaStr}. Właściciele: ${data.dzial2.owners.map(o => o.name).join(", ")}. Obciążenia: ${data.dzial4.hasEntries ? "Hipoteka aktywna" : "Brak"}.`
-      }
+      drafts: buildDrafts(data),
     });
   };
 
   const handleBackToSelect = () => {
+    setAutoOpenLibrary(false);
+    setParsedResult(null);
+  };
+
+  // Opens the selection screen with the saved-books library expanded — available
+  // from the workstation header so the notary can jump to another księga.
+  const handleOpenLibrary = () => {
+    setActiveTab("sim");
+    setAutoOpenLibrary(true);
     setParsedResult(null);
   };
 
@@ -86,14 +90,30 @@ export default function App() {
             </div>
           </div>
 
-          <div className="flex items-center gap-6">
+          <div className="flex items-center gap-4 sm:gap-6">
+            {parsedResult && (
+              <button
+                onClick={handleOpenLibrary}
+                title="Otwórz bibliotekę pobranych ksiąg"
+                className="inline-flex items-center gap-1.5 text-[10px] uppercase font-bold tracking-wider text-[#1A1A1A] border border-[#1A1A1A] bg-transparent hover:bg-[#1A1A1A] hover:text-white px-2.5 py-1.5 transition-all duration-200 cursor-pointer"
+              >
+                <BookOpen className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Biblioteka</span>
+              </button>
+            )}
             <div className="hidden md:flex flex-col items-end">
               <span className="text-[9px] uppercase text-[#7A7772] font-bold tracking-widest">Kancelaria Notarialna</span>
               <span className="text-xs font-serif italic text-[#1A1A1A]">Pulpit Nowego Aktu</span>
             </div>
-            <span className="hidden sm:inline-flex items-center gap-1.5 text-[10px] uppercase font-bold tracking-wider text-[#7A7772] bg-[#F5F2ED] border border-[#D1CEC8] px-2.5 py-1">
+            <a
+              href="https://isap.sejm.gov.pl/isap.nsf/download.xsp/WDU19820190147/U/D19820147Lj.pdf"
+              target="_blank"
+              rel="noopener noreferrer"
+              title="Otwórz ustawę o księgach wieczystych i hipotece (ISAP, PDF)"
+              className="hidden sm:inline-flex items-center gap-1.5 text-[10px] uppercase font-bold tracking-wider text-[#7A7772] bg-[#F5F2ED] border border-[#D1CEC8] px-2.5 py-1 hover:text-[#1A1A1A] hover:border-[#1A1A1A] transition-colors duration-200 no-underline"
+            >
               Ustawa o KW i hipotece
-            </span>
+            </a>
           </div>
         </div>
       </header>
@@ -179,6 +199,7 @@ export default function App() {
                   onDataLoaded={handleSimulationDataLoaded}
                   onStartLoading={handleStartLoading}
                   onStopLoading={handleStopLoading}
+                  autoOpenLibrary={autoOpenLibrary}
                 />
               )}
 
