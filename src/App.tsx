@@ -25,6 +25,7 @@ export default function App() {
     structured: KWData;
     drafts: DraftSet;
     rawApify?: any;
+    validation?: { ok: boolean; issues: string[]; aiAssisted: boolean };
   } | null>(null);
 
   // Legal facts listed during loader screens to calm the user
@@ -48,11 +49,12 @@ export default function App() {
     setIsLoading(false);
   };
 
-  const handleSimulationDataLoaded = (data: KWData, rawApify?: any) => {
+  const handleSimulationDataLoaded = (data: KWData, rawApify?: any, validation?: { ok: boolean; issues: string[]; aiAssisted: boolean }) => {
     // Build all three drafts from the single, shared, data-driven generator.
     setParsedResult({
       structured: data,
       rawApify,
+      validation,
       drafts: buildDrafts(data),
     });
   };
@@ -218,6 +220,7 @@ export default function App() {
               initialData={parsedResult.structured}
               initialDrafts={parsedResult.drafts}
               rawApify={parsedResult.rawApify}
+              validation={parsedResult.validation}
               onReimport={handleBackToSelect}
             />
           </div>

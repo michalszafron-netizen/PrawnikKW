@@ -230,6 +230,22 @@ function allNotices(data: KWData): string[] {
   ].filter(Boolean);
 }
 
+/** Migration comments (Rubryki x.9/x.14 "Komentarz do migracji") per dział. They
+ * often explain discrepancies (e.g. how the total area was composed), so they
+ * belong in the description. */
+function migrationComments(data: KWData): { label: string; text: string }[] {
+  const out: { label: string; text: string }[] = [];
+  const add = (label: string, t?: string) => {
+    if (t && t.trim()) out.push({ label, text: t.trim() });
+  };
+  add("Dział I-O", data.dzial1O.migrationComment);
+  add("Dział I-Sp", data.dzial1Sp.migrationComment);
+  add("Dział II", data.dzial2.migrationComment);
+  add("Dział III", data.dzial3.migrationComment);
+  add("Dział IV", data.dzial4.migrationComment);
+  return out;
+}
+
 // ----------------------------------------------------------------------------
 // Main entry point
 // ----------------------------------------------------------------------------
@@ -256,6 +272,7 @@ export function buildDrafts(data: KWData, options: BuildDraftsOptions = {}): Dra
   const d3 = dzial3Clause(data);
   const d4 = mortgagesClause(data);
   const notices = allNotices(data);
+  const migr = migrationComments(data);
 
   // ---- Classic (dense notarial prose) ----
   const classicParts: string[] = [];
@@ -276,6 +293,11 @@ export function buildDrafts(data: KWData, options: BuildDraftsOptions = {}): Dra
   );
   classicParts.push(`W Dziale III: ${d3}.`);
   classicParts.push(`W Dziale IV: ${d4}.`);
+  if (migr.length > 0) {
+    classicParts.push(
+      `Komentarze do migracji: ${migr.map((m) => `${m.label} — ${m.text}`).join("; ")}.`,
+    );
+  }
   if (notices.length > 0) {
     classicParts.push(
       `UWAGA — w księdze ujawniono wzmianki o wnioskach (wyłączają rękojmię wiary publicznej ksiąg wieczystych): ${notices.join(
@@ -299,6 +321,11 @@ export function buildDrafts(data: KWData, options: BuildDraftsOptions = {}): Dra
   if (notices.length > 0) {
     modernLines.push(
       `6. Wzmianki o wnioskach (wyłączają rękojmię wiary publicznej): ${notices.join("; ")}.`,
+    );
+  }
+  if (migr.length > 0) {
+    modernLines.push(
+      `${notices.length > 0 ? 7 : 6}. Komentarze do migracji: ${migr.map((m) => `${m.label} — ${m.text}`).join("; ")}.`,
     );
   }
   const modern = modernLines.join("\n");

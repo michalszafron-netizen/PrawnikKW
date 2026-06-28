@@ -71,6 +71,7 @@ export interface KWData {
     joinSeparation?: string;
     notices?: string[];
     applicationData?: string;
+    migrationComment?: string;
   };
 
   dzial1Sp: {
@@ -79,6 +80,7 @@ export interface KWData {
     associatedRights: EasementEntity[];
     notices?: string[];
     applicationData?: string;
+    migrationComment?: string;
   };
 
   dzial2: {
@@ -86,6 +88,7 @@ export interface KWData {
     isPerpetualUsufruct: boolean;
     notices?: string[];
     applicationData?: string;
+    migrationComment?: string;
   };
 
   dzial3: {
@@ -98,6 +101,7 @@ export interface KWData {
     disposalRestrictions?: EasementEntity[];
     notices?: string[];
     applicationData?: string;
+    migrationComment?: string;
   };
 
   dzial4: {
@@ -105,6 +109,7 @@ export interface KWData {
     mortgages: MortgageEntity[];
     notices?: string[];
     applicationData?: string;
+    migrationComment?: string;
   };
 
   notarySettings?: {

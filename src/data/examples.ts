@@ -8,12 +8,12 @@ import { PreconfiguredExample } from "../types";
 export const PRECONFIGURED_EXAMPLES: PreconfiguredExample[] = [
   {
     id: "mieszkanie-mokotow",
-    kwNumber: "WA1M/00348754/2",
+    kwNumber: "WA1M/00348754/5",
     title: "Mieszkanie z hipoteką (Warszawa)",
     subtitle: "Lokal mieszkalny • Wspólność małżeńska • Hipoteka bankowa",
     description: "Standardowy odpis lokalu stanowiącego odrębną własność, ze spłatą kredytu hipotecznego oraz udziałem w gruncie i nieruchomości wspólnej.",
     data: {
-      kwNumber: "WA1M/00348754/2",
+      kwNumber: "WA1M/00348754/5",
       sadRejonowy: "Sąd Rejonowy dla Warszawy-Mokotowa w Warszawie",
       wydzialKw: "VII Wydział Ksiąg Wieczystych",
       status: "active",

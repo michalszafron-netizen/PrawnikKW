@@ -8,6 +8,12 @@ import { Search, Server, Shield, Smartphone, ArrowRight, Check, AlertCircle, Ref
 import { PRECONFIGURED_EXAMPLES } from "../data/examples";
 import { KWData } from "../types";
 
+interface ValidationInfo {
+  ok: boolean;
+  issues: string[];
+  aiAssisted: boolean;
+}
+
 interface CachedKW {
   kwNumber: string;
   viewType: "aktualna" | "zupelna";
@@ -19,6 +25,7 @@ interface CachedKW {
   data: KWData;
   rawApify?: any;
   parserVersion?: number;
+  validation?: ValidationInfo;
 }
 
 const KW_CACHE_KEY = "lexparser_kw_cache";
@@ -26,7 +33,7 @@ const KW_CACHE_KEY = "lexparser_kw_cache";
 // Must match PARSER_VERSION in server.ts. If a cached entry was mapped by an
 // older parser, we re-map it from its stored rawApify (no Apify/network call
 // needed) the next time it's opened from the library — see remapIfStale().
-const MIN_PARSER_VERSION = 6;
+const MIN_PARSER_VERSION = 9;
 
 function getCachedBooks(): CachedKW[] {
   try {
@@ -82,6 +89,55 @@ function incrementQueryCount(): number {
   return count;
 }
 
+// --- EKW check-digit validation -------------------------------------------------
+// Official land-register check digit: over (courtCode + 8-digit number), each
+// character is mapped to a value (digits 0-9; letters per the table below),
+// multiplied by the cyclic weights [1,3,7], summed, mod 10. Verified against
+// known-good numbers WA1M/00348754/5 and KA1T/00086962/7.
+const KW_CHAR_VALUES: Record<string, number> = {
+  "0": 0, "1": 1, "2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8, "9": 9,
+  "X": 10, "A": 11, "B": 12, "C": 13, "D": 14, "E": 15, "F": 16, "G": 17, "H": 18,
+  "I": 19, "J": 20, "K": 21, "L": 22, "M": 23, "N": 24, "O": 25, "P": 26, "R": 27,
+  "S": 28, "T": 29, "U": 30, "W": 31, "Y": 32, "Z": 33,
+};
+const KW_WEIGHTS = [1, 3, 7];
+
+function computeKwCheckDigit(courtCode: string, bookNumber: string): number | null {
+  const s = (courtCode + bookNumber.padStart(8, "0")).toUpperCase();
+  let sum = 0;
+  for (let i = 0; i < s.length; i++) {
+    const v = KW_CHAR_VALUES[s[i]];
+    if (v === undefined) return null; // unknown char — can't validate
+    sum += v * KW_WEIGHTS[i % 3];
+  }
+  return sum % 10;
+}
+
+// One-time local repair: older cache entries may be keyed under the number the
+// user typed (possibly a wrong check digit). The stored rawApify carries the
+// authoritative number — realign the entry to it, no re-fetch needed. Also
+// de-duplicates entries that collapse onto the same corrected key.
+function migrateCachedBooks(): CachedKW[] {
+  const books = getCachedBooks();
+  let changed = false;
+  const seen = new Set<string>();
+  const result: CachedKW[] = [];
+  for (const b of books) {
+    const auth = String(b.rawApify?.kwNumber || "").trim().toUpperCase();
+    if (/^[A-Z0-9]{4}\/\d{6,}\/\d$/.test(auth) && auth !== b.kwNumber) {
+      b.kwNumber = auth;
+      if (b.data) b.data.kwNumber = auth;
+      changed = true;
+    }
+    const key = `${b.kwNumber}|${b.viewType}`;
+    if (seen.has(key)) { changed = true; continue; } // drop duplicate
+    seen.add(key);
+    result.push(b);
+  }
+  if (changed) saveCachedBooks(result);
+  return result;
+}
+
 function extractLastEntryDate(data: KWData, rawApify?: any): string {
   if (!rawApify) return "";
   const allSections = [rawApify.dzialIO, rawApify.dzialISp, rawApify.dzialII, rawApify.dzialIII, rawApify.dzialIV].filter(Boolean);
@@ -99,7 +155,7 @@ function extractLastEntryDate(data: KWData, rawApify?: any): string {
 }
 
 interface EKWBrowserSimProps {
-  onDataLoaded: (data: KWData, rawApify?: any) => void;
+  onDataLoaded: (data: KWData, rawApify?: any, validation?: ValidationInfo) => void;
   onStartLoading: () => void;
   onStopLoading: () => void;
   autoOpenLibrary?: boolean;
@@ -109,7 +165,7 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
   // Input states
   const [courtCode, setCourtCode] = useState("WA1M");
   const [bookNumber, setBookNumber] = useState("00348754");
-  const [controlNum, setControlNum] = useState("2");
+  const [controlNum, setControlNum] = useState("5");
 
   // View type toggle
   const [viewType, setViewType] = useState<"aktualna" | "zupelna">("zupelna");
@@ -133,11 +189,17 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
   const [showLibrary, setShowLibrary] = useState(!!autoOpenLibrary && getCachedBooks().length > 0);
   const [queryCount, setQueryCount] = useState<number>(getQueryCount());
 
+  // One-time local realignment of cached KW numbers to their authoritative value.
+  useEffect(() => {
+    setCachedBooks(migrateCachedBooks());
+  }, []);
+
   // Auto compile current book number
   const fullKW = `${courtCode}/${bookNumber}/${controlNum}`;
 
   const loadFromCache = async (cached: CachedKW) => {
     let bookData = cached.data;
+    let validation: ValidationInfo | undefined = cached.validation;
 
     // If this entry was mapped by an older parser, re-map it locally from the
     // rawApify it already carries — no Apify/government portal call needed.
@@ -151,10 +213,12 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
         const remapped = await remapRes.json();
         if (remapRes.ok && remapped.mapped) {
           bookData = remapped.mapped;
+          if (remapped.validation) validation = remapped.validation;
           const updatedEntry: CachedKW = {
             ...cached,
             data: bookData,
-            parserVersion: remapped.parserVersion
+            parserVersion: remapped.parserVersion,
+            validation
           };
           addToCache(updatedEntry);
           setCachedBooks(getCachedBooks());
@@ -175,7 +239,7 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
       }
     };
     setSimulatedResult(data);
-    onDataLoaded(data, cached.rawApify);
+    onDataLoaded(data, cached.rawApify, validation);
     const parts = cached.kwNumber.split("/");
     if (parts.length === 3) {
       setCourtCode(parts[0]);
@@ -228,6 +292,16 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
     }
     if (!/^\d$/.test(controlNum)) {
       alert("Cyfra kontrolna musi być pojedynczą cyfrą (0-9).");
+      return;
+    }
+
+    // Validate the EKW check digit before spending a (paid) Apify query.
+    const expected = computeKwCheckDigit(courtCode, bookNumber);
+    if (expected !== null && expected !== parseInt(controlNum, 10)) {
+      alert(
+        `Nieprawidłowa cyfra kontrolna dla ${courtCode}/${bookNumber.padStart(8, "0")}.\n` +
+        `Poprawna cyfra kontrolna to: ${expected}. Popraw numer i spróbuj ponownie.`
+      );
       return;
     }
 
@@ -337,8 +411,12 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
           }
         };
         const lastEntry = extractLastEntryDate(dataWithSettings, parsed.raw);
+        // Use the authoritative KW number returned by the parser (correct check
+        // digit), not necessarily what the user typed.
+        const authoritativeKW = (dataWithSettings.kwNumber || kwToFetch).replace(/\s+/g, "").toUpperCase();
+        const validation: ValidationInfo | undefined = parsed.validation;
         const cacheEntry: CachedKW = {
-          kwNumber: kwToFetch.replace(/\s+/g, "").toUpperCase(),
+          kwNumber: authoritativeKW,
           viewType: viewToFetch,
           fetchedAt: new Date().toISOString(),
           lastEntryDate: lastEntry,
@@ -347,14 +425,15 @@ export default function EKWBrowserSim({ onDataLoaded, onStartLoading, onStopLoad
           ownerNames: dataWithSettings.dzial2.owners.map(o => o.name),
           data: dataWithSettings,
           rawApify: parsed.raw,
-          parserVersion: parsed.parserVersion || MIN_PARSER_VERSION
+          parserVersion: parsed.parserVersion || MIN_PARSER_VERSION,
+          validation
         };
         addToCache(cacheEntry);
         setCachedBooks(getCachedBooks());
         // Count this as one real (billable) EKW fetch.
         setQueryCount(incrementQueryCount());
         setSimulatedResult(dataWithSettings);
-        onDataLoaded(dataWithSettings, parsed.raw);
+        onDataLoaded(dataWithSettings, parsed.raw, validation);
         setStep("success");
       } else {
         throw new Error(parsed.error || "Nie udało się pobrać danych z EKW.");

@@ -67,7 +67,7 @@ const COURT_MAP: Record<string, { court: string; dept: string }> = {
 
 // Bump whenever mapApifyToKWData() parsing logic changes — used to invalidate
 // stale localStorage cache entries that were mapped with an older parser.
-const PARSER_VERSION = 6;
+const PARSER_VERSION = 9;
 
 // Extract the actual data value from Apify's pipe-separated format
 // e.g. "1. | 1 | --- | ŚLĄSKIE" → "ŚLĄSKIE"
@@ -86,6 +86,19 @@ function firstSeg(rawValue: string): string {
   if (!rawValue) return "";
   const first = rawValue.split("|")[0]?.trim();
   return (!first || first === "---") ? "" : first;
+}
+
+// Recover the "Komentarz do migracji" (field A) from a dział's rawText. The
+// scraper frequently drops this long field from the structured entries (keeping
+// only field B), but it survives in rawText. Field A label ends with
+// "...przeniesione z dotychczasowej księgi wieczystej"; value runs to "B: Ostatni numer".
+function extractMigrationComment(rawText: string): string {
+  if (!rawText) return "";
+  const m = rawText.match(
+    /przeniesione z dotychczasowej księgi wieczystej\s*([\s\S]*?)\s*B:\s*Ostatni numer/
+  );
+  if (!m) return "";
+  return (m[1] || "").replace(/^\s*\d+\.\s*-*\s*/, "").trim();
 }
 
 // Find entry by label pattern and extract the clean value.
@@ -186,6 +199,13 @@ function mapApifyToKWData(raw: any, kwNumber: string, courtInfo: { court: string
   // The two EKW views ("zupełna" = full history, "aktualna" = current state) use
   // noticeably different field encodings. We branch on this where they diverge.
   const isAktualna = (raw.viewType || "").toLowerCase() === "aktualna";
+
+  // Prefer the authoritative KW number returned by the scraper. The check digit a
+  // user types may be wrong (e.g. the demo default or a typo) — the EKW portal/
+  // scraper resolves the book by court code + number and returns the correct,
+  // validated number. Using it keeps the cache key, display and drafts consistent.
+  const rawKwNumber = String(raw.kwNumber || "").trim().toUpperCase();
+  const effectiveKwNumber = /^[A-Z0-9]{4}\/\d{6,}\/\d$/.test(rawKwNumber) ? rawKwNumber : kwNumber;
 
   // ======================== DZIAŁ I-O ========================
   const wojewodztwo = findEntry(ioEntries, "województwo");
@@ -316,94 +336,127 @@ function mapApifyToKWData(raw: any, kwNumber: string, courtInfo: { court: string
 
   // ======================== DZIAŁ II ========================
   const owners: any[] = [];
-  let currentShare = "";
-  let currentShareType = "";
-  let ownerFirstName = "";
-  let ownerSecondName = "";
-  let ownerSurname = "";
-  let ownerSurname2 = "";
-  let ownerFather = "";
-  let ownerMother = "";
-  let ownerPesel = "";
-  let inPersonSection = false;
-  let basisText = "";
 
-  // Extract basis of acquisition from WNIOSKI section
+  // Extract basis of acquisition (Podstawa nabycia). In the WNIOSKI section it
+  // appears either as "Wskazanie podstawy" (inna podstawa) or "Tytuł aktu" (akt
+  // notarialny). Strip any trailing descriptive note like "(wskazanie podstawy)".
+  let basisText = "";
   for (const entry of iiEntries) {
-    if (entry.label !== "_header" && /wskazanie podstawy/i.test(entry.value || "")) {
-      const val = extractVal(entry.value);
-      // The "aktualna" view appends a descriptive note like "(wskazanie podstawy)"
-      // to the value — strip it for a clean basis string.
-      if (val) basisText = val.replace(/\s*\((?:wskazanie podstawy|inna podstawa)\)\s*$/i, "").trim();
+    const v = entry.value || "";
+    if (entry.label !== "_header" && (/wskazanie podstawy/i.test(v) || /tytuł aktu/i.test(v))) {
+      const val = extractVal(v);
+      if (val) basisText = val.replace(/\s*\((?:wskazanie podstawy|inna podstawa|tytuł aktu)\)\s*$/i, "").trim();
     }
   }
 
-  for (let i = 0; i < iiEntries.length; i++) {
-    const entry = iiEntries[i];
-    const label = entry.label || "";
-    const value = entry.value || "";
+  const titleCase = (s: string) => s ? s.charAt(0).toUpperCase() + s.slice(1).toLowerCase() : "";
 
-    // Share section
-    if (/wielkość udziału/i.test(label)) {
-      const shareVal = extractVal(value);
-      const shareMatch = shareVal.match(/(\d+)\s*\/\s*(\d+)/);
-      currentShare = shareMatch ? `${shareMatch[1]}/${shareMatch[2]}` : shareVal || "brak danych";
+  // Udziały (Podrubryka 2.2.1): map "numer udziału w prawie" -> {share, wspólność}.
+  // Owners reference their udział via "Lista wskazań udziałów w prawie".
+  const udzialMap = new Map<string, { share: string; wspolnosc: string }>();
+  {
+    let inUdzial = false;
+    let curNo = "";
+    for (const e of iiEntries) {
+      const v = e.value || "";
+      if (e.label === "_header") {
+        if (/podrubryka\s*2\.2\.1/i.test(v)) { inUdzial = true; continue; }
+        if (/podrubryka\s*2\.2\.[2-9]/i.test(v) || /rubryka\s*2\.[3-9]/i.test(v)) { inUdzial = false; continue; }
+        continue;
+      }
+      if (!inUdzial) continue;
+      if (/numer udziału w prawie/i.test(v)) {
+        curNo = extractVal(v);
+        if (curNo) udzialMap.set(curNo, { share: "", wspolnosc: "" });
+      } else if (/wielkość udziału/i.test(e.label || "")) {
+        const sv = extractVal(v);
+        const m = sv.match(/(\d+)\s*\/\s*(\d+)/);
+        const u = udzialMap.get(curNo);
+        if (u) u.share = m ? `${m[1]}/${m[2]}` : sv;
+      } else if (/rodzaj wspólności/i.test(e.label || "")) {
+        const sv = extractVal(v);
+        const u = udzialMap.get(curNo);
+        if (u && sv) u.wspolnosc = sv;
+      }
     }
-    if (/rodzaj wspólności/i.test(label)) {
-      currentShareType = extractVal(value);
-      if (currentShareType) currentShare += ` (${currentShareType.toLowerCase()})`;
-    }
+  }
 
-    // Person fields (Podrubryka 2.2.5)
-    if (entry.label === "_header" && /osoba fizyczna/i.test(value)) {
-      inPersonSection = true;
-      ownerFirstName = ownerSecondName = ownerSurname = ownerSurname2 = ownerFather = ownerMother = ownerPesel = "";
-      continue;
+  const shareForUdzial = (no: string): string => {
+    const u = udzialMap.get(no);
+    if (u && u.share) return `${u.share}${u.wspolnosc ? ` (${u.wspolnosc.toLowerCase()})` : ""}`;
+    // Single-udział księga: a person may not reference it explicitly.
+    if (udzialMap.size === 1) {
+      const only = udzialMap.get([...udzialMap.keys()][0]);
+      if (only && only.share) return `${only.share}${only.wspolnosc ? ` (${only.wspolnosc.toLowerCase()})` : ""}`;
     }
+    return "";
+  };
 
-    if (inPersonSection) {
-      if (/imię pierwsze/i.test(label)) ownerFirstName = extractVal(value);
-      else if (/imię drugie/i.test(label)) ownerSecondName = extractVal(value);
-      else if (/nazwisko.*pierwszy człon|^4\.\s*nazwisko/i.test(label)) ownerSurname = extractVal(value);
-      else if (/drugi człon/i.test(label)) ownerSurname2 = extractVal(value);
-      else if (/imię ojca/i.test(label)) ownerFather = extractVal(value);
-      else if (/imię matki/i.test(label)) ownerMother = extractVal(value);
-      else if (/pesel/i.test(label)) {
-        ownerPesel = extractVal(value);
-        // PESEL is the last field — finalize this owner
-        const fullName = [ownerFirstName, ownerSecondName, ownerSurname, ownerSurname2].filter(Boolean).join(" ");
-        const titleCase = (s: string) => s ? s.charAt(0).toUpperCase() + s.slice(1).toLowerCase() : "";
-        const parentsStr = ownerFather || ownerMother
-          ? `syn/córka ${titleCase(ownerFather)}${ownerFather && ownerMother ? " i " : ""}${titleCase(ownerMother)}`
+  // Natural persons (Podrubryka 2.2.5). IMPORTANT: multiple persons live under ONE
+  // sub-rubric header, each delimited by a "Lista wskazań udziałów w prawie" row
+  // (not by repeated headers). We must finalize on each delimiter, not on PESEL.
+  {
+    let inPersons = false;
+    let cur: any = null;
+    const finalize = () => {
+      if (cur && (cur.first || cur.sur)) {
+        const fullName = [cur.first, cur.second, cur.sur, cur.sur2].filter(Boolean).join(" ");
+        const parents = cur.father || cur.mother
+          ? `syn/córka ${titleCase(cur.father)}${cur.father && cur.mother ? " i " : ""}${titleCase(cur.mother)}`
           : "";
-
         owners.push({
           id: `own-${owners.length}`,
           name: fullName.toUpperCase(),
-          peselOrRegon: /^\d{11}$/.test(ownerPesel) ? ownerPesel : "",
-          parentsNames: parentsStr,
-          share: currentShare || "brak danych",
+          peselOrRegon: /^\d{11}$/.test(cur.pesel) ? cur.pesel : "",
+          parentsNames: parents,
+          share: shareForUdzial(cur.udzial) || "brak danych",
+          communityType: (cur.udzial && udzialMap.get(cur.udzial)?.wspolnosc) || "",
           basisOfAcquisition: basisText || ""
         });
-        inPersonSection = false;
+      }
+      cur = null;
+    };
+    for (const e of iiEntries) {
+      const label = e.label || "";
+      const value = e.value || "";
+      if (e.label === "_header") {
+        if (/podrubryka\s*2\.2\.5/i.test(value)) { finalize(); inPersons = true; continue; }
+        if (inPersons && (/podrubryka/i.test(value) || /rubryka\s*2\.[3-9]/i.test(value) || /wnioski/i.test(value))) {
+          finalize(); inPersons = false; continue;
+        }
+        continue;
+      }
+      if (!inPersons) continue;
+      if (/lista wskazań udziałów/i.test(value)) {
+        finalize();
+        cur = { udzial: extractVal(value), first: "", second: "", sur: "", sur2: "", father: "", mother: "", pesel: "" };
+      } else if (cur) {
+        if (/imię pierwsze/i.test(label)) cur.first = extractVal(value);
+        else if (/imię drugie/i.test(label)) cur.second = extractVal(value);
+        else if (/nazwisko.*pierwszy człon|^4\.\s*nazwisko/i.test(label)) cur.sur = extractVal(value);
+        else if (/drugi człon/i.test(label)) cur.sur2 = extractVal(value);
+        else if (/imię ojca/i.test(label)) cur.father = extractVal(value);
+        else if (/imię matki/i.test(label)) cur.mother = extractVal(value);
+        else if (/pesel/i.test(label)) cur.pesel = extractVal(value);
       }
     }
+    finalize();
+  }
 
-    // Legal entity (Podrubryka 2.2.4)
-    if (entry.label === "_header" && /inna osoba prawna/i.test(value)) {
-      // Look ahead for Nazwa, Siedziba, REGON
-      let entityName = "", entityCity = "", entityRegon = "";
-      for (let j = i + 1; j < Math.min(i + 15, iiEntries.length); j++) {
+  // Legal entities (Podrubryka 2.2.4).
+  for (let i = 0; i < iiEntries.length; i++) {
+    const entry = iiEntries[i];
+    if (entry.label === "_header" && /inna osoba prawna/i.test(entry.value || "")) {
+      let entityName = "", entityCity = "", entityRegon = "", entityUdzial = "";
+      for (let j = i + 1; j < Math.min(i + 18, iiEntries.length); j++) {
         const nextLabel = (iiEntries[j].label || "").toLowerCase();
-        if (/^1\.\s*$/.test(iiEntries[j].label || "") && /nazwa/i.test(iiEntries[j].value || "")) {
-          entityName = extractVal(iiEntries[j].value);
-        }
-        if (/nazwa/i.test(nextLabel) && !/^_header$/.test(iiEntries[j].label)) {
-          entityName = extractVal(iiEntries[j].value);
-        }
-        if (/siedziba/i.test(nextLabel)) entityCity = extractVal(iiEntries[j].value);
-        if (/regon/i.test(nextLabel)) entityRegon = extractVal(iiEntries[j].value);
-        if (iiEntries[j].label === "_header" && /podrubryka|rubryka/i.test(iiEntries[j].value || "")) break;
+        const nextVal = iiEntries[j].value || "";
+        if (/lista wskazań udziałów/i.test(nextVal)) entityUdzial = extractVal(nextVal);
+        if (/^1\.\s*$/.test(iiEntries[j].label || "") && /nazwa/i.test(nextVal)) entityName = extractVal(nextVal);
+        if (/nazwa/i.test(nextLabel) && iiEntries[j].label !== "_header") entityName = extractVal(nextVal);
+        if (/siedziba/i.test(nextLabel)) entityCity = extractVal(nextVal);
+        if (/regon/i.test(nextLabel)) entityRegon = extractVal(nextVal);
+        if (iiEntries[j].label === "_header" && /podrubryka|rubryka/i.test(nextVal)) break;
       }
       if (entityName) {
         owners.push({
@@ -411,7 +464,7 @@ function mapApifyToKWData(raw: any, kwNumber: string, courtInfo: { court: string
           name: entityName.toUpperCase(),
           peselOrRegon: entityRegon ? `REGON: ${entityRegon}` : "",
           parentsNames: entityCity ? `siedziba: ${entityCity}` : "",
-          share: currentShare || "brak danych",
+          share: shareForUdzial(entityUdzial) || "brak danych",
           basisOfAcquisition: basisText || ""
         });
       }
@@ -489,6 +542,44 @@ function mapApifyToKWData(raw: any, kwNumber: string, courtInfo: { court: string
       share: "brak danych",
       basisOfAcquisition: basisText || ""
     });
+  }
+
+  // Entry date + journal number for the ownership (Dział II "Dane o wniosku i
+  // chwili wpisu"). Generic for both views: read the "Chwila wpisu" date and the
+  // "Numer dziennika"; fall back to the condensed "aktualna" wniosek header line.
+  let ownerEntryDate = "";
+  let ownerEntryNumber = "";
+  for (const e of iiEntries) {
+    const lab = e.label || "";
+    if (/chwila wpisu/i.test(lab) && !ownerEntryDate) {
+      const dm = extractVal(e.value).match(/(\d{4}-\d{2}-\d{2})/);
+      if (dm) ownerEntryDate = dm[1];
+    }
+    if (/numer dziennika/i.test(lab) && !ownerEntryNumber) {
+      const nm = (e.value || "").match(/([A-Z0-9]{2,4}\s*\/\s*\d+\s*\/\s*\d+(?:\s*\/\s*\d+)?)/);
+      if (nm) ownerEntryNumber = nm[1].replace(/\s+/g, "");
+    }
+  }
+  if (!ownerEntryDate || !ownerEntryNumber) {
+    // "aktualna" packs it into one header line, e.g.
+    // "DZ. KW./KA1T/00003467/25/001, 2025-03-28 11:16:00, 2025-04-28-..., NIE, ... (rodzaj i numer dziennika, chwila wpływu, chwila wpisu, ...)"
+    for (const e of iiEntries) {
+      const v = e.value || "";
+      if (/rodzaj i numer dziennika/i.test(v) || /^DZ\.\s*KW/i.test(v)) {
+        if (!ownerEntryNumber) {
+          const nm = v.match(/([A-Z0-9]{2,4}\/\d+\/\d+\/\d+)/);
+          if (nm) ownerEntryNumber = nm[1];
+        }
+        if (!ownerEntryDate) {
+          const dates = v.match(/\d{4}-\d{2}-\d{2}/g);
+          if (dates && dates.length) ownerEntryDate = dates[dates.length - 1]; // chwila wpisu is the later date
+        }
+      }
+    }
+  }
+  for (const o of owners) {
+    if (!o.entryDate && ownerEntryDate) o.entryDate = ownerEntryDate;
+    if (!o.entryNumber && ownerEntryNumber) o.entryNumber = ownerEntryNumber;
   }
 
   const isPerpetualUsufruct = iiEntries.some((e: any) => /użytkownik wieczysty/i.test(e.value || "")) ||
@@ -782,8 +873,16 @@ function mapApifyToKWData(raw: any, kwNumber: string, courtInfo: { court: string
   const sadRejonowy = courtInfo.court;
   const wydzialKw = courtInfo.dept;
 
+  // Migration comments (Rubryki 1.9 / 1.14 / 2.8 / 3.7 / 4.7) — recovered from
+  // rawText because the scraper drops them from the structured entries.
+  const ioComment = extractMigrationComment(dzialIO.rawText || "");
+  const iSpComment = extractMigrationComment(dzialISp.rawText || "");
+  const iiComment = extractMigrationComment(dzialII.rawText || "");
+  const iiiComment = extractMigrationComment(dzialIII.rawText || "");
+  const ivComment = extractMigrationComment(dzialIV.rawText || "");
+
   return {
-    kwNumber,
+    kwNumber: effectiveKwNumber,
     sadRejonowy,
     wydzialKw,
     status: "active" as const,
@@ -798,34 +897,79 @@ function mapApifyToKWData(raw: any, kwNumber: string, courtInfo: { court: string
       basisDocuments: basisDocsIO || "",
       joinSeparation: joinSeparation || "",
       notices: ioNotices.length > 0 ? ioNotices : undefined,
-      applicationData: ioAppData || undefined
+      applicationData: ioAppData || undefined,
+      migrationComment: ioComment || undefined
     },
     dzial1Sp: {
       hasEntries: !dzialISp.empty,
       shareInJointProperty: shareInJointProp || "",
       associatedRights: iSpAssociated,
-      applicationData: applicationDataISp || undefined
+      applicationData: applicationDataISp || undefined,
+      migrationComment: iSpComment || undefined
     },
     dzial2: {
       owners,
       isPerpetualUsufruct,
       notices: iiNotices.length > 0 ? iiNotices : undefined,
-      applicationData: iiAppData || undefined
+      applicationData: iiAppData || undefined,
+      migrationComment: iiComment || undefined
     },
     dzial3: {
       hasEntries: !dzialIII.empty,
       easements,
       warningsAndExecutions: warnings,
       otherRights,
-      notices: iiiNotices.length > 0 ? iiiNotices : undefined
+      notices: iiiNotices.length > 0 ? iiiNotices : undefined,
+      migrationComment: iiiComment || undefined
     },
     dzial4: {
       hasEntries: !dzialIV.empty && mortgages.length > 0,
       mortgages,
       notices: ivNotices.length > 0 ? ivNotices : undefined,
-      applicationData: ivAppData || undefined
+      applicationData: ivAppData || undefined,
+      migrationComment: ivComment || undefined
     }
   };
+}
+
+// Post-mapping sanity checks. Flags cases where the deterministic parser likely
+// missed data (a non-empty dział that produced nothing, a placeholder owner, etc.)
+// so we can trigger an AI fallback and/or warn the notary. Conservative — only
+// reliable signals, to avoid false alarms.
+function validateMapping(mapped: any, raw: any): { ok: boolean; issues: string[] } {
+  const issues: string[] = [];
+  const d2empty = raw?.dzialII?.empty === true;
+  const d4empty = raw?.dzialIV?.empty === true;
+  const dIOempty = raw?.dzialIO?.empty === true;
+  const owners = mapped?.dzial2?.owners || [];
+  const mortgages = mapped?.dzial4?.mortgages || [];
+
+  if (!d2empty && owners.length === 0) {
+    issues.push("Dział II nie jest pusty, a nie odczytano żadnego właściciela.");
+  }
+  if (owners.some((o: any) => /dane w surowym tekście/i.test(o?.name || ""))) {
+    issues.push("Właściciel nie został rozpoznany (placeholder) — sprawdź Dział II.");
+  }
+  if (owners.length > 0 && owners.every((o: any) => !o?.share || o.share === "brak danych")) {
+    issues.push("Nie odczytano wielkości udziałów właścicieli.");
+  }
+  if (!d4empty && mortgages.length === 0) {
+    issues.push("Dział IV nie jest pusty, a nie odczytano żadnej hipoteki.");
+  }
+  if (!dIOempty && !String(mapped?.dzial1O?.location || "").trim()) {
+    issues.push("Brak położenia nieruchomości (Dział I-O).");
+  }
+
+  return { ok: issues.length === 0, issues };
+}
+
+// Which sections each issue concerns — used to target the AI fallback merge.
+function issuesTouch(issues: string[], section: "owners" | "mortgages" | "location"): boolean {
+  const text = issues.join(" ").toLowerCase();
+  if (section === "owners") return /właściciel|udział|dział ii/.test(text);
+  if (section === "mortgages") return /hipotek|dział iv/.test(text);
+  if (section === "location") return /położeni|dział i-o/.test(text);
+  return false;
 }
 
 async function startServer() {
@@ -855,6 +999,81 @@ Szczegółowe wytyczne:
   const SIMULATION_SYSTEM_INSTRUCTION = `Jesteś polskim systemem EKW (Elektroniczne Księgi Wieczyste). Twój cel to wygenerować realistyczny i w 100% poprawny merytorycznie testowy odpis księgi wieczystej o podanym numerze oraz dla wskazanego Sądu Rejonowego.
 Wygeneruj dane dla całkowicie nowego fikcyjnego, lecz niezwykle realistycznego przypadku: właściciele (polskie imiona i nazwiska, pasujące rodzice, losowe PESEL-e), hipoteki (np. kredyt w polskim banku), działka ewidencyjna ze współrzędnymi/obrębem lub mieszkanie z udziałem w nieruchomości wspólnej.
 Zwróć dane w formacie JSON zgodnym ze wskazanym schematem.`;
+
+  // AI fallback: when validation flags missing/garbled sections, ask the LLM to
+  // parse the raw EKW text and MERGE only the failing sections into the
+  // deterministic result (never overwrite good deterministic data). Returns
+  // whether anything was AI-assisted.
+  const aiAssistMapping = async (mapped: any, raw: any, issues: string[]): Promise<boolean> => {
+    const client = getDeepseekClient();
+    if (!client) return false;
+
+    const rawText = [raw?.dzialIO, raw?.dzialISp, raw?.dzialII, raw?.dzialIII, raw?.dzialIV]
+      .map((d: any) => d?.rawText)
+      .filter(Boolean)
+      .join("\n\n");
+    if (!rawText.trim()) return false;
+
+    const prompt = `Przeanalizuj surowy tekst księgi wieczystej i zwróć WYŁĄCZNIE obiekt JSON o strukturze:
+{
+  "dzial1O": { "location": "string", "description": "string" },
+  "dzial2": { "owners": [{ "name": "string", "peselOrRegon": "string", "parentsNames": "string", "share": "string", "basisOfAcquisition": "string" }] },
+  "dzial4": { "mortgages": [{ "type": "string", "amount": number, "currency": "string", "creditor": "string", "securesWhat": "string" }] }
+}
+Zasady: nazwiska WIELKIMI literami; udział w formie "licznik/mianownik" z dopiskiem rodzaju wspólności w nawiasie jeśli występuje; wymień WSZYSTKICH współwłaścicieli; nie wymyślaj danych, których nie ma w tekście.
+
+--- TEKST KSIĘGI ---
+${rawText}
+--- KONIEC ---`;
+
+    try {
+      const resp = await client.chat.completions.create({
+        model: LLM_MODEL,
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system", content: GENERATION_SYSTEM_INSTRUCTION },
+          { role: "user", content: prompt },
+        ],
+        temperature: 0.2,
+      });
+      const parsed = JSON.parse((resp.choices[0].message.content || "{}").trim());
+      const s = parsed.structured || parsed;
+      let assisted = false;
+
+      if (issuesTouch(issues, "owners") && Array.isArray(s?.dzial2?.owners) && s.dzial2.owners.length > 0) {
+        mapped.dzial2.owners = s.dzial2.owners.map((o: any, i: number) => ({
+          id: `own-ai-${i}`,
+          name: String(o.name || "").toUpperCase(),
+          peselOrRegon: o.peselOrRegon || "",
+          parentsNames: o.parentsNames || "",
+          share: o.share || "brak danych",
+          basisOfAcquisition: o.basisOfAcquisition || "",
+        }));
+        assisted = true;
+      }
+      if (issuesTouch(issues, "mortgages") && Array.isArray(s?.dzial4?.mortgages) && s.dzial4.mortgages.length > 0) {
+        mapped.dzial4.mortgages = s.dzial4.mortgages.map((m: any, i: number) => ({
+          id: `mort-ai-${i}`,
+          type: m.type || "hipoteka",
+          amount: typeof m.amount === "number" ? m.amount : parseFloat(String(m.amount || "0").replace(/[^\d.,]/g, "").replace(",", ".")) || 0,
+          currency: m.currency || "PLN",
+          creditor: m.creditor || "",
+          securesWhat: m.securesWhat || "",
+        }));
+        mapped.dzial4.hasEntries = mapped.dzial4.mortgages.length > 0;
+        assisted = true;
+      }
+      if (issuesTouch(issues, "location") && s?.dzial1O?.location) {
+        mapped.dzial1O.location = s.dzial1O.location;
+        if (!mapped.dzial1O.description && s.dzial1O.description) mapped.dzial1O.description = s.dzial1O.description;
+        assisted = true;
+      }
+      return assisted;
+    } catch (e: any) {
+      console.error("[AI fallback] error:", e.message);
+      return false;
+    }
+  };
 
   // API Route: Web Crawler Simulator & Custom Simulated/Demo Generation
   app.post("/api/simulate-kw", async (req, res) => {
@@ -1390,7 +1609,13 @@ Odpowiedz WYŁĄCZNIE obiektem JSON:
       }
 
       const mapped = mapApifyToKWData(raw, normalized, courtInfo);
-      res.json({ mapped, raw, parserVersion: PARSER_VERSION });
+      let validation = validateMapping(mapped, raw);
+      let aiAssisted = false;
+      if (!validation.ok) {
+        aiAssisted = await aiAssistMapping(mapped, raw, validation.issues);
+        if (aiAssisted) validation = validateMapping(mapped, raw); // re-check after merge
+      }
+      res.json({ mapped, raw, parserVersion: PARSER_VERSION, validation: { ...validation, aiAssisted } });
     } catch (error: any) {
       console.error("[Apify] Fetch error:", error.message);
       res.status(500).json({ error: "Błąd połączenia z Apify: " + error.message });
@@ -1400,7 +1625,7 @@ Odpowiedz WYŁĄCZNIE obiektem JSON:
   // Re-run the mapper over an already-fetched raw Apify payload (e.g. one stored
   // in a client's localStorage cache). No Apify/government portal call involved —
   // lets the client pick up parser fixes without re-scraping a book it already has.
-  app.post("/api/remap-kw", (req, res) => {
+  app.post("/api/remap-kw", async (req, res) => {
     const { raw, kwNumber } = req.body;
     if (!raw || !kwNumber) {
       return res.status(400).json({ error: "Brak danych raw lub kwNumber." });
@@ -1412,7 +1637,13 @@ Odpowiedz WYŁĄCZNIE obiektem JSON:
     };
     try {
       const mapped = mapApifyToKWData(raw, kwNumber, courtInfo);
-      res.json({ mapped, parserVersion: PARSER_VERSION });
+      let validation = validateMapping(mapped, raw);
+      let aiAssisted = false;
+      if (!validation.ok) {
+        aiAssisted = await aiAssistMapping(mapped, raw, validation.issues);
+        if (aiAssisted) validation = validateMapping(mapped, raw);
+      }
+      res.json({ mapped, parserVersion: PARSER_VERSION, validation: { ...validation, aiAssisted } });
     } catch (error: any) {
       res.status(500).json({ error: "Błąd mapowania danych: " + error.message });
     }

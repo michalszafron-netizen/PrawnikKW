@@ -10,6 +10,7 @@ import {
   AlertTriangle,
   Eye,
   EyeOff,
+  FileText,
 } from "lucide-react";
 
 interface RubricViewerProps {
@@ -159,6 +160,20 @@ function parseRubricsFlat(entries: RubricEntry[]): Rubric[] {
   }
 
   return rubrics;
+}
+
+// Recover the "Komentarz do migracji" (field A) text. The Apify scraper often
+// drops this long field from the structured entries (keeping only field B), but
+// it survives in the section's rawText. The A-label always ends with
+// "...przeniesione z dotychczasowej księgi wieczystej" and the value runs until
+// "B: Ostatni numer ...".
+function extractMigrationComment(rawText?: string): string {
+  if (!rawText) return "";
+  const m = rawText.match(
+    /przeniesione z dotychczasowej księgi wieczystej\s*([\s\S]*?)\s*B:\s*Ostatni numer/
+  );
+  if (!m) return "";
+  return (m[1] || "").replace(/^\s*\d+\.\s*-*\s*/, "").trim();
 }
 
 // Pick the right parser based on the data shape (zupełna has Rubryka/Podrubryka
@@ -330,7 +345,7 @@ const DZIAL_CONFIG: {
 
 export default function RubricViewer({ rawApify, kwNumber }: RubricViewerProps) {
   const [openDzialy, setOpenDzialy] = useState<Set<string>>(
-    new Set(["IO", "ISp", "II", "III", "IV"])
+    new Set(["OKL", "IO", "ISp", "II", "III", "IV"])
   );
   const [showEmpty, setShowEmpty] = useState(true);
   const [searchQuery, setSearchQuery] = useState("");
@@ -353,7 +368,30 @@ export default function RubricViewer({ rawApify, kwNumber }: RubricViewerProps) 
     });
   };
 
-  const sections: DzialSection[] = DZIAL_CONFIG.map((cfg) => {
+  // Synthetic "Okładka" (cover) section. The Apify scraper does not return the
+  // cover rubrics (0.x), but a few cover fields arrive as top-level values — we
+  // surface those so the Rubryki layout mirrors the portal (Okładka first).
+  const coverEntries: RubricEntry[] = [];
+  const pushCover = (label: string, val: any) => {
+    const s = (val === null || val === undefined) ? "" : String(val).trim();
+    if (s && s.toLowerCase() !== "null") coverEntries.push({ label, value: s });
+  };
+  pushCover("Numer księgi", rawApify.kwNumber);
+  pushCover("Sąd / nazwa wydziału", rawApify.courtName);
+  pushCover("Kod wydziału", rawApify.courtCode);
+  pushCover("Typ księgi", rawApify.propertyType);
+
+  const coverSection: DzialSection = {
+    key: "OKL",
+    title: "Okładka — Oznaczenie Księgi Wieczystej",
+    icon: <FileText className="w-3.5 h-3.5" />,
+    empty: coverEntries.length === 0,
+    rubrics: coverEntries.length > 0
+      ? [{ id: "Rubryka 0.1 - Informacje podstawowe", title: "Rubryka 0.1 - Informacje podstawowe", entries: coverEntries, subrubrics: [] }]
+      : [],
+  };
+
+  const sections: DzialSection[] = [coverSection, ...DZIAL_CONFIG.map((cfg) => {
     const raw = rawApify[cfg.rawKey];
     if (!raw)
       return {
@@ -370,9 +408,22 @@ export default function RubricViewer({ rawApify, kwNumber }: RubricViewerProps) 
       icon: cfg.icon,
       empty: raw.empty === true,
       rawText: raw.rawText,
-      rubrics: buildRubrics(raw.entries || []),
+      rubrics: (() => {
+        const rubrics = buildRubrics(raw.entries || []);
+        // Inject the migration comment (field A) that the scraper dropped.
+        const comment = extractMigrationComment(raw.rawText);
+        if (comment) {
+          for (const r of rubrics) {
+            if (/Komentarz/i.test(r.title)) {
+              const already = r.entries.some((e) => (e.value || "").includes(comment.slice(0, 24)));
+              if (!already) r.entries.unshift({ label: "Komentarz do migracji", value: comment });
+            }
+          }
+        }
+        return rubrics;
+      })(),
     };
-  });
+  })];
 
   const allRubricIds = new Set<string>();
   for (const sec of sections) {

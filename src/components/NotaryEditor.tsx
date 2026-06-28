@@ -44,6 +44,7 @@ interface NotaryEditorProps {
   initialData: KWData;
   initialDrafts: DraftSet;
   rawApify?: any;
+  validation?: { ok: boolean; issues: string[]; aiAssisted: boolean };
   onReimport: () => void;
 }
 
@@ -308,6 +309,7 @@ export default function NotaryEditor({
   initialData,
   initialDrafts,
   rawApify,
+  validation,
   onReimport,
 }: NotaryEditorProps) {
   const [data, setData] = useState<KWData>(initialData);
@@ -641,8 +643,40 @@ export default function NotaryEditor({
     (data.dzial3.notices?.length || 0) > 0 ||
     (data.dzial4.notices?.length || 0) > 0;
 
+  const migrationNotes = [
+    ["Dział I-O", data.dzial1O.migrationComment],
+    ["Dział I-Sp", data.dzial1Sp.migrationComment],
+    ["Dział II", data.dzial2.migrationComment],
+    ["Dział III", data.dzial3.migrationComment],
+    ["Dział IV", data.dzial4.migrationComment],
+  ].filter(([, t]) => t && String(t).trim()) as [string, string][];
+
+  const showValidationBanner = !!validation && (!validation.ok || validation.aiAssisted);
+
   return (
-    <div className="grid grid-cols-1 xl:grid-cols-12 gap-8 items-stretch xl:h-[calc(100vh-11rem)]">
+    <div className="flex flex-col gap-3 xl:h-[calc(100vh-11rem)]">
+      {showValidationBanner && (
+        <div className={`border px-4 py-2.5 flex items-start gap-2 ${
+          validation!.ok
+            ? "bg-sky-50 border-sky-300"
+            : "bg-amber-50 border-amber-400"
+        }`}>
+          <AlertTriangle className={`w-4 h-4 shrink-0 mt-0.5 ${validation!.ok ? "text-sky-700" : "text-amber-700"}`} />
+          <div className="text-[11px] leading-snug">
+            {validation!.aiAssisted && (
+              <div className="font-bold text-sky-900">
+                Część danych odczytano z pomocą AI (parser deterministyczny miał luki). Zweryfikuj w zakładce „Rubryki".
+              </div>
+            )}
+            {!validation!.ok && (
+              <div className={validation!.aiAssisted ? "mt-1 text-amber-800" : "font-bold text-amber-900"}>
+                Możliwe braki w odczycie danych: {validation!.issues.join(" ")} Sprawdź „Rubryki" i w razie potrzeby popraw w Edytorze.
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+      <div className="grid grid-cols-1 xl:grid-cols-12 gap-8 items-stretch flex-1 min-h-0">
       {/* LEFT COLUMN: Structural editor */}
       <div className="xl:col-span-6 flex flex-col gap-4 xl:overflow-y-auto xl:pr-2 custom-scroll">
         <div className="bg-[#FDFCFB] border border-[#D1CEC8] p-5 sm:p-6 shadow-sm space-y-4">
@@ -722,6 +756,23 @@ export default function NotaryEditor({
               <span className="text-[10px] font-bold text-amber-800 uppercase tracking-wider">
                 Uwaga: Wykryto wzmianki o wnioskach w tej księdze
               </span>
+            </div>
+          )}
+
+          {migrationNotes.length > 0 && (
+            <div className="bg-sky-50 border border-sky-300 p-3 space-y-1.5">
+              <span className="text-[9px] font-bold text-sky-800 uppercase tracking-wider flex items-center gap-1.5">
+                <FileText className="w-3 h-3" /> Komentarze do migracji
+              </span>
+              {migrationNotes.map(([label, text]) => (
+                <div key={label} className="text-[11px] leading-snug">
+                  <span className="font-bold text-sky-900">{label}:</span>{" "}
+                  <span className="text-[#1A1A1A] font-serif">{text}</span>
+                </div>
+              ))}
+              <p className="text-[9px] text-sky-700/80 italic pt-0.5">
+                Treść z migracji księgi — często wyjaśnia rozbieżności (np. sposób zsumowania powierzchni). Uwzględniona w opisie po prawej.
+              </p>
             </div>
           )}
 
@@ -1665,6 +1716,7 @@ export default function NotaryEditor({
           </div>
         </div>
       </div>
+    </div>
     </div>
   );
 }

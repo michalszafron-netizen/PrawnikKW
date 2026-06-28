@@ -114,7 +114,7 @@ export default function ManualPaster({ onParsedResult, onStartLoading, onStopLoa
   };
 
   const handlePasteDemoText = () => {
-    setRawText(`Księga Wieczysta nr WA1M/00348754/2
+    setRawText(`Księga Wieczysta nr WA1M/00348754/5
 Sąd Rejonowy dla Warszawy-Mokotowa, VII Wydział Ksiąg Wieczystych.
 DZIAŁ I-O: Oznaczenie nieruchomości
 POŁOŻENIE: Województwo Mazowieckie, m.st. Warszawa, dzielnica Mokotów. Przeznaczenie: Samodzielny lokal mieszkalny oznaczony nr 15 przy ulicy Puławskiej 142 w Warszawie.
