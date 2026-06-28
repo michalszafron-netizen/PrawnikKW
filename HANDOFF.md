@@ -74,34 +74,22 @@ Zmienione, niezacommitowane pliki: `server.ts`, `src/App.tsx`, `src/components/{
 
 ## 5. DO DOKOŃCZENIA (kolejność)
 
-### ZADANIE A (główne): Komentarz migracyjny → Edytor + drafty
-Obecnie komentarz migracyjny widać TYLKO w Rubrykach. Trzeba go przenieść do `KWData`, Edytora i draftów (jest istotny prawnie — np. wyjaśnia, że obszar 58,07 m² = mieszkanie 48,86 + piwnica 9,21).
+> STATUS: Zadania A, B, C **WYKONANE** (commit `b0d40ea`). Sekcja zostawiona jako opis tego, co zrobiono / jak testować przy kolejnych zmianach.
 
-Kroki:
-1. **`src/types.ts`** — dodać do `KWData.dzial1O` pole `migrationComment?: string;` (ewentualnie też do `dzial1Sp`/`dzial2` jeśli chcesz komentarze z innych działów; na start wystarczy I‑O).
-2. **`server.ts`** — w `mapApifyToKWData` dodać ekstrakcję z `dzialIO.rawText` (przenieś logikę z `RubricViewer.extractMigrationComment`):
-   ```ts
-   const migrationComment = (() => {
-     const rt = dzialIO.rawText || "";
-     const m = rt.match(/przeniesione z dotychczasowej księgi wieczystej\s*([\s\S]*?)\s*B:\s*Ostatni numer/);
-     return m ? (m[1]||"").replace(/^\s*\d+\.\s*-*\s*/,"").trim() : "";
-   })();
-   ```
-   i ustawić w zwracanym `dzial1O.migrationComment = migrationComment || undefined`.
-3. **Podbij `PARSER_VERSION` → 9 i `MIN_PARSER_VERSION` → 9** (server.ts + EKWBrowserSim.tsx).
-4. **`src/lib/draftBuilder.ts`** — w `buildDrafts` dodać komentarz do opisu Działu I‑O (classic + modern), np. zdanie „Komentarz (migracja): {migrationComment}." gdy niepuste. W `short` raczej pominąć.
-5. **`src/components/NotaryEditor.tsx`** — w sekcji Działu I‑O dodać pole (czytelne, najlepiej edytowalne `migrationComment`), np. pod opisem. Można też za chipem widoczności.
-6. Test: `POST /api/remap-kw` na GD1G zupelna → sprawdź `mapped.dzial1O.migrationComment` = „W POLU OBSZAR ZSUMOWANO POWIERZCHNIĘ…". Sprawdź drafty (buildDrafts) i baner.
-7. (Opcjonalnie) skoro logika jest w `server.ts`, można uprościć `RubricViewer` żeby brał z mapped — ale NIE trzeba; Rubryki czytają rawApify i mają własny extractor (zostaw).
+### ZADANIE A (główne): Komentarz migracyjny → Edytor + drafty — ✅ ZROBIONE
+Zaimplementowane: pole `migrationComment` w `KWData` (wszystkie 5 działów, `src/types.ts`); ekstrakcja `extractMigrationComment` z `rawText` w `server.ts` (ustawiane na każdym dziale); w `draftBuilder.ts` helper `migrationComments()` dokleja je do draftów classic+modern; w `NotaryEditor.tsx` baner „Komentarze do migracji". `PARSER_VERSION=9`/`MIN_PARSER_VERSION=9`. Zweryfikowane na GD1G: `dzial1O.migrationComment` = „W POLU OBSZAR ZSUMOWANO POWIERZCHNIĘ: MIESZKANIA 48,86 M2 ORAZ PIWNICY 9,21 M2…", draft classic zawiera komentarz.
 
-### ZADANIE B: Live‑test fallbacku AI
-Wymuś brak właścicieli (np. w teście podmień `raw.dzialII.entries` na sam nagłówek, zostaw `rawText`) i wywołaj `/api/remap-kw` — oczekuj `validation.aiAssisted=true` i uzupełnionych właścicieli. UWAGA: to płatne wołanie DeepSeek i obciąża pamięć (serwer może paść — restartuj). Kod jest gotowy, brakuje tylko potwierdzenia na żywo.
+### ZADANIE B: Live‑test fallbacku AI — ✅ ZROBIONE
+Potwierdzone: po wyzerowaniu `raw.dzialII.entries` (z zachowaniem `rawText`) `/api/remap-kw` zwrócił `validation.aiAssisted=true` i uzupełnił 4 właścicieli (WA1M). UWAGA: płatne wołanie DeepSeek + obciąża pamięć (serwer bywa ubijany — restartuj).
 
-### ZADANIE C: Push na GitHub (na końcu)
-- Repo: `github.com/michalszafron-netizen/PrawnikKW.git` (origin, branch `main`, token osadzony w URL — NIE wyświetlać; zrewokować przed produkcją).
-- Stage TYLKO kod/dok: `git add server.ts src/ .gitignore HANDOFF.md PROJECT_OVERVIEW.md`.
-- **NIE commituj** danych osobowych: `opis_kw_*.txt`, `przyklady/` (realne odpisy z PESEL/nazwiskami) ani `.vscode/`, `apify_dumps/` (gitignored). Użytkownik potwierdził, że KW są publiczne, ale na serwer na razie ich nie wrzucamy.
-- Commit po polsku, opis zmian. Push: `git push origin main` (przefiltruj token w outpus: `-replace 'ghp_\w+','***'`).
+### ZADANIE C: Push na GitHub — ✅ ZROBIONE (commit `b0d40ea`)
+Repo `github.com/michalszafron-netizen/PrawnikKW.git` (origin/main; token w URL — NIE wyświetlać, zrewokować przed produkcją). Wypchnięto kod + `HANDOFF.md`. **NIE** wypchnięto danych osobowych: `opis_kw_*.txt`, `przyklady/`, `.vscode/`, `apify_dumps/` (gitignored). Kolejny push: `git add server.ts src/ .gitignore HANDOFF.md`, commit po polsku, `git push origin main` (filtruj token: `-replace 'ghp_\w+','***'`).
+
+### Pomysły na dalej (opcjonalne)
+- Komentarze migracyjne z pozostałych działów (I‑Sp/II/III/IV) już są w `KWData` i draftach — sprawdzić na księdze, która je ma.
+- Doinstalować `@types/react` i usunąć 2 znane błędy `key` w `RubricViewer`.
+- Sum‑to‑1 check udziałów w `validateMapping` (na razie pominięty, by uniknąć fałszywych alarmów).
+- Pełna „Okładka" (Rubryki 0.2/0.3/0.4) — wymaga, by Apify ją zwracał (obecnie nie).
 
 ---
 
