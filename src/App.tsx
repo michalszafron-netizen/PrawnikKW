@@ -4,18 +4,14 @@
  */
 
 import React, { useState } from "react";
-import { Scale, FileText, ClipboardPen, HelpCircle, Loader2, Sparkles, Building2, Gavel, BookOpen } from "lucide-react";
+import { Scale, FileText, ClipboardPen, Loader2, Sparkles, Gavel, BookOpen } from "lucide-react";
 import ManualPaster from "./components/ManualPaster";
 import EKWBrowserSim from "./components/EKWBrowserSim";
 import NotaryEditor from "./components/NotaryEditor";
-import EKWHelp from "./components/EKWHelp";
 import { KWData } from "./types";
 import { buildDrafts, DraftSet } from "./lib/draftBuilder";
 
-type ActiveTab = "paste" | "sim" | "help";
-
 export default function App() {
-  const [activeTab, setActiveTab] = useState<ActiveTab>("sim");
   const [isLoading, setIsLoading] = useState(false);
   const [loadingFact, setLoadingFact] = useState("Inicjowanie modelu językowego...");
   const [autoOpenLibrary, setAutoOpenLibrary] = useState(false);
@@ -67,7 +63,6 @@ export default function App() {
   // Opens the selection screen with the saved-books library expanded — available
   // from the workstation header so the notary can jump to another księga.
   const handleOpenLibrary = () => {
-    setActiveTab("sim");
     setAutoOpenLibrary(true);
     setParsedResult(null);
   };
@@ -166,46 +161,15 @@ export default function App() {
               </p>
             </div>
 
-            {/* Workplace selectors for source selection */}
-            <div className="flex justify-center border-b border-[#D1CEC8] max-w-lg mx-auto w-full mb-2">
-              <div className="flex gap-1 w-full">
-                <button
-                  onClick={() => setActiveTab("sim")}
-                  className={`flex-1 py-3 text-center border-b-2 text-xs uppercase tracking-widest font-bold flex items-center justify-center gap-2 transition-all cursor-pointer ${
-                    activeTab === "sim"
-                      ? "border-[#1A1A1A] text-[#1A1A1A] bg-white/40"
-                      : "border-transparent text-[#7A7772] hover:text-[#1A1A1A]"
-                  }`}
-                >
-                  <Building2 className="w-3.5 h-3.5" />
-                  Wyszukiwarka EKW
-                </button>
-                <button
-                  onClick={() => setActiveTab("help")}
-                  className={`flex-1 py-3 text-center border-b-2 text-xs uppercase tracking-widest font-bold flex items-center justify-center gap-2 transition-all cursor-pointer ${
-                    activeTab === "help"
-                      ? "border-[#1A1A1A] text-[#1A1A1A] bg-white/40"
-                      : "border-transparent text-[#7A7772] hover:text-[#1A1A1A]"
-                  }`}
-                >
-                  <HelpCircle className="w-3.5 h-3.5" />
-                  Instrukcja
-                </button>
-              </div>
-            </div>
-
-            {/* Rendering matching work tabs */}
+            {/* Instrukcja tab hidden for now (stara, nieaktualna) — EKWHelp.tsx
+                pozostaje w kodzie, łatwo przywrócić zakładkę później. */}
             <div className="flex-1">
-              {activeTab === "sim" && (
-                <EKWBrowserSim
-                  onDataLoaded={handleSimulationDataLoaded}
-                  onStartLoading={handleStartLoading}
-                  onStopLoading={handleStopLoading}
-                  autoOpenLibrary={autoOpenLibrary}
-                />
-              )}
-
-              {activeTab === "help" && <EKWHelp />}
+              <EKWBrowserSim
+                onDataLoaded={handleSimulationDataLoaded}
+                onStartLoading={handleStartLoading}
+                onStopLoading={handleStopLoading}
+                autoOpenLibrary={autoOpenLibrary}
+              />
             </div>
           </div>
         )}
