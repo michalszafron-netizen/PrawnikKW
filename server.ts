@@ -67,7 +67,7 @@ const COURT_MAP: Record<string, { court: string; dept: string }> = {
 
 // Bump whenever mapApifyToKWData() parsing logic changes — used to invalidate
 // stale localStorage cache entries that were mapped with an older parser.
-const PARSER_VERSION = 9;
+const PARSER_VERSION = 11;
 
 // Extract the actual data value from Apify's pipe-separated format
 // e.g. "1. | 1 | --- | ŚLĄSKIE" → "ŚLĄSKIE"
@@ -77,6 +77,21 @@ function extractVal(rawValue: string): string {
   const parts = rawValue.split("|").map(s => s.trim());
   const last = parts[parts.length - 1];
   return (!last || last === "---") ? "" : last;
+}
+
+// In the "zupełna" (full history) view, a "Numer X w prawie" / "Lista wskazań..."
+// row's value has the shape "<Indeks> | <nr wpisu, Wpisu> | <nr wpisu, Wykr.> | <treść>".
+// A non-"---" value in the Wykr. (second-to-last) slot means THIS entry was struck
+// out by a later wpis — e.g. an owner who sold their share, or an udział replaced by
+// a later transaction. Such entries are historical only and must not be reported as
+// part of the current legal state (zupełna intentionally keeps the full history
+// visible in Rubryki, but the Edytor/drafts must reflect only what's still valid).
+function isWykreslone(rawValue: string): boolean {
+  if (!rawValue) return false;
+  const parts = rawValue.split("|").map(s => s.trim());
+  if (parts.length < 2) return false;
+  const wykr = parts[parts.length - 2];
+  return !!wykr && wykr !== "---";
 }
 
 // In the "aktualna" (current) EKW view many fields are encoded as
@@ -399,7 +414,10 @@ function mapApifyToKWData(raw: any, kwNumber: string, courtInfo: { court: string
     let inPersons = false;
     let cur: any = null;
     const finalize = () => {
-      if (cur && (cur.first || cur.sur)) {
+      // A wykreślony (struck-out) "Lista wskazań udziałów" row means this person no
+      // longer owns the property — they were replaced by a later transaction (e.g.
+      // sold their share). Zupełna keeps them visible for history; we must not.
+      if (cur && !cur.cancelled && (cur.first || cur.sur)) {
         const fullName = [cur.first, cur.second, cur.sur, cur.sur2].filter(Boolean).join(" ");
         const parents = cur.father || cur.mother
           ? `syn/córka ${titleCase(cur.father)}${cur.father && cur.mother ? " i " : ""}${titleCase(cur.mother)}`
@@ -429,7 +447,7 @@ function mapApifyToKWData(raw: any, kwNumber: string, courtInfo: { court: string
       if (!inPersons) continue;
       if (/lista wskazań udziałów/i.test(value)) {
         finalize();
-        cur = { udzial: extractVal(value), first: "", second: "", sur: "", sur2: "", father: "", mother: "", pesel: "" };
+        cur = { udzial: extractVal(value), cancelled: isWykreslone(value), first: "", second: "", sur: "", sur2: "", father: "", mother: "", pesel: "" };
       } else if (cur) {
         if (/imię pierwsze/i.test(label)) cur.first = extractVal(value);
         else if (/imię drugie/i.test(label)) cur.second = extractVal(value);
@@ -447,18 +465,19 @@ function mapApifyToKWData(raw: any, kwNumber: string, courtInfo: { court: string
   for (let i = 0; i < iiEntries.length; i++) {
     const entry = iiEntries[i];
     if (entry.label === "_header" && /inna osoba prawna/i.test(entry.value || "")) {
-      let entityName = "", entityCity = "", entityRegon = "", entityUdzial = "";
+      let entityName = "", entityCity = "", entityRegon = "", entityUdzial = "", entityCancelled = false;
       for (let j = i + 1; j < Math.min(i + 18, iiEntries.length); j++) {
         const nextLabel = (iiEntries[j].label || "").toLowerCase();
         const nextVal = iiEntries[j].value || "";
-        if (/lista wskazań udziałów/i.test(nextVal)) entityUdzial = extractVal(nextVal);
+        if (/lista wskazań udziałów/i.test(nextVal)) { entityUdzial = extractVal(nextVal); entityCancelled = isWykreslone(nextVal); }
         if (/^1\.\s*$/.test(iiEntries[j].label || "") && /nazwa/i.test(nextVal)) entityName = extractVal(nextVal);
         if (/nazwa/i.test(nextLabel) && iiEntries[j].label !== "_header") entityName = extractVal(nextVal);
         if (/siedziba/i.test(nextLabel)) entityCity = extractVal(nextVal);
         if (/regon/i.test(nextLabel)) entityRegon = extractVal(nextVal);
         if (iiEntries[j].label === "_header" && /podrubryka|rubryka/i.test(nextVal)) break;
       }
-      if (entityName) {
+      // Struck-out entity entry — superseded by a later transaction, not a current owner.
+      if (entityName && !entityCancelled) {
         owners.push({
           id: `own-${owners.length}`,
           name: entityName.toUpperCase(),
@@ -476,22 +495,28 @@ function mapApifyToKWData(raw: any, kwNumber: string, courtInfo: { court: string
   // (e.g. "Osoba fizyczna (Imię ... PESEL)" → "JAN KOWALSKI, OJCIEC, MATKA, PESEL")
   // rather than as per-field rows. Runs only if the per-field parser found nothing.
   if (owners.length === 0 && !dzialII.empty) {
-    // Share lives in "Lista wskazań udziałów..." e.g. value "Lp. 1. | 1 | 1 /1 | --- | 2".
-    let condShare = "";
-    const shareEntry = iiEntries.find((e: any) =>
-      /lista wskazań udziałów|wielkość udziału/i.test(e.label || "")
-    );
-    if (shareEntry) {
-      const m = (shareEntry.value || "").match(/(\d+)\s*\/\s*(\d+)/);
-      if (m) condShare = `${m[1]}/${m[2]}`;
-    }
-
     const titleCase = (s: string) => s ? s.charAt(0).toUpperCase() + s.slice(1).toLowerCase() : "";
+
+    // Each owner row is immediately PRECEDED by its OWN "Lista wskazań udziałów..."
+    // line, e.g. "Lp. 1. | <numer udziału> | <licznik>/<mianownik> | <wspólność|---> | <n>".
+    // When several owners share one udział (e.g. married couple) the line repeats
+    // identically before each of them; when there are several DIFFERENT udziały
+    // (e.g. two couples owning 2/3 and 1/3 respectively) it differs per owner — so
+    // we must track it as we walk the entries, never reuse one single value for all.
+    let pendingShare = "";
 
     for (const e of iiEntries) {
       const label = e.label || "";
       if (label === "_header") continue;
       const rawValue = e.value || "";
+
+      if (/lista wskazań udziałów|wielkość udziału/i.test(label)) {
+        const segs = rawValue.split("|").map((s: string) => s.trim());
+        const m = rawValue.match(/(\d+)\s*\/\s*(\d+)/);
+        const wsp = segs[3] && segs[3] !== "---" ? segs[3] : "";
+        pendingShare = m ? `${m[1]}/${m[2]}${wsp ? ` (${wsp.toLowerCase()})` : ""}` : "";
+        continue;
+      }
 
       // Natural person: "IMIĘ1 IMIĘ2 NAZWISKO, imię ojca, imię matki, PESEL"
       if (/osoba fizyczna/i.test(label)) {
@@ -510,7 +535,7 @@ function mapApifyToKWData(raw: any, kwNumber: string, courtInfo: { court: string
           name: fullName.toUpperCase(),
           peselOrRegon: pesel,
           parentsNames: parentsStr,
-          share: condShare || "brak danych",
+          share: pendingShare || "brak danych",
           basisOfAcquisition: basisText || ""
         });
       }
@@ -525,7 +550,7 @@ function mapApifyToKWData(raw: any, kwNumber: string, courtInfo: { court: string
             name: name.toUpperCase(),
             peselOrRegon: regon ? `REGON: ${regon}` : "",
             parentsNames: parts[1] && !/^\d{9,14}$/.test(parts[1]) ? `siedziba: ${parts[1]}` : "",
-            share: condShare || "brak danych",
+            share: pendingShare || "brak danych",
             basisOfAcquisition: basisText || ""
           });
         }
@@ -978,21 +1003,34 @@ function issuesTouch(issues: string[], section: "owners" | "mortgages" | "locati
 // File holds księga data (incl. PII) — gitignored.
 const STORE_PATH = path.join(process.cwd(), "kw_store.json");
 
+interface ChatMessage {
+  role: "user" | "assistant";
+  content: string;
+  ts: string;
+  insertText?: string;
+}
+
 interface KwStore {
   library: any[];
   usage: { month: string; count: number };
+  // Persistent per-księga chat threads, keyed by chatKey(kwNumber, viewType).
+  chats: Record<string, ChatMessage[]>;
 }
 
 function readStore(): KwStore {
   try {
     if (fs.existsSync(STORE_PATH)) {
       const s = JSON.parse(fs.readFileSync(STORE_PATH, "utf-8"));
-      return { library: Array.isArray(s.library) ? s.library : [], usage: s.usage || { month: "", count: 0 } };
+      return {
+        library: Array.isArray(s.library) ? s.library : [],
+        usage: s.usage || { month: "", count: 0 },
+        chats: s.chats && typeof s.chats === "object" ? s.chats : {},
+      };
     }
   } catch (e: any) {
     console.error("[store] read error:", e.message);
   }
-  return { library: [], usage: { month: "", count: 0 } };
+  return { library: [], usage: { month: "", count: 0 }, chats: {} };
 }
 
 function writeStore(s: KwStore) {
@@ -1006,6 +1044,10 @@ function writeStore(s: KwStore) {
 function storeMonthKey(): string {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+}
+
+function chatKey(kwNumber: string, viewType: string): string {
+  return `${kwNumber}|${viewType}`;
 }
 
 async function startServer() {
@@ -1745,6 +1787,125 @@ Odpowiedz WYŁĄCZNIE obiektem JSON:
     } catch (error: any) {
       res.status(500).json({ error: "Błąd mapowania danych: " + error.message });
     }
+  });
+
+  // ---- Persistent chat about a specific księga (context = rawApify text + KWData) --
+  app.get("/api/chat", (req, res) => {
+    const { kwNumber, viewType } = req.query as { kwNumber?: string; viewType?: string };
+    if (!kwNumber || !viewType) {
+      return res.status(400).json({ error: "Brak kwNumber lub viewType." });
+    }
+    const store = readStore();
+    res.json({ messages: store.chats[chatKey(kwNumber, viewType)] || [] });
+  });
+
+  app.post("/api/chat", async (req, res) => {
+    const { kwNumber, viewType, message, data, rawApify } = req.body as {
+      kwNumber?: string;
+      viewType?: string;
+      message?: string;
+      data?: any;
+      rawApify?: any;
+    };
+    if (!kwNumber || !viewType || !message || !message.trim()) {
+      return res.status(400).json({ error: "Brak treści wiadomości." });
+    }
+
+    const client = getDeepseekClient();
+    if (!client) {
+      return res.status(503).json({ error: "Czat AI wymaga skonfigurowanego klucza DEEPSEEK_API_KEY." });
+    }
+
+    const store = readStore();
+    const key = chatKey(kwNumber, viewType);
+    const history = store.chats[key] || [];
+
+    // Full raw text of every dział — lets the assistant answer about details the
+    // deterministic parser may have missed or simplified, not just the structured KWData.
+    const rawText = rawApify
+      ? [rawApify.dzialIO, rawApify.dzialISp, rawApify.dzialII, rawApify.dzialIII, rawApify.dzialIV]
+          .map((d: any) => d?.rawText)
+          .filter(Boolean)
+          .join("\n\n")
+      : "";
+
+    const INSERT_MARKER = "---WSTAW_DO_DRAFTU---";
+    const systemPrompt = `Jesteś asystentem prawnym polskiego notariusza, specjalistą od ksiąg wieczystych (EKW). Rozmawiasz wyłącznie o JEDNEJ, konkretnej księdze — masz pełny dostęp do jej surowej treści i danych ustrukturyzowanych poniżej. Odpowiadaj precyzyjnie, KONKRETNIE PO POLSKU (cała odpowiedź, bez ani jednego słowa po angielsku), krótko i na temat. Jeśli czegoś nie ma w danych, powiedz to wprost — nie wymyślaj faktów. Nigdy nie pokazuj swojego procesu rozumowania — napisz wyłącznie ostateczną, gotową odpowiedź.
+
+Odpowiedz zwykłym tekstem (bez JSON, bez Markdown). Jeśli — i tylko jeśli — masz konkretny fragment tekstu nadający się do wstawienia do projektu aktu notarialnego (sformułowanie opisu, klauzula), dopisz go na samym końcu swojej odpowiedzi w nowej linii, zaczynając od znacznika "${INSERT_MARKER}", np.:
+Treść odpowiedzi dla notariusza.
+${INSERT_MARKER}
+Tekst do wstawienia do draftu.
+Jeśli nic nie nadaje się do wstawienia, NIE dodawaj tego znacznika wcale.
+
+DANE KSIĘGI (JSON):
+${JSON.stringify(data ?? {}, null, 0)}
+${rawText ? `\nSUROWA TREŚĆ KSIĘGI (z portalu EKW, wszystkie działy):\n${rawText}` : ""}`;
+
+    const callModel = () =>
+      client.chat.completions.create({
+        model: LLM_MODEL,
+        messages: [
+          { role: "system", content: systemPrompt },
+          ...history.map((h) => ({ role: h.role, content: h.content })),
+          { role: "user", content: message },
+        ],
+        temperature: 0.4,
+        max_tokens: 8192,
+      });
+
+    try {
+      let response = await callModel();
+      let rawContent = (response.choices[0].message.content || "").trim();
+
+      // Reasoning models occasionally spend the whole token budget on hidden
+      // "thinking" and leave the visible content blank — retry once rather than
+      // showing the user an empty/broken answer.
+      if (!rawContent) {
+        console.error("[Chat] Empty content on first attempt, retrying once. finish_reason:", response.choices[0].finish_reason);
+        response = await callModel();
+        rawContent = (response.choices[0].message.content || "").trim();
+      }
+
+      let reply: string;
+      let suggestedInsert: string | undefined;
+      if (rawContent.includes(INSERT_MARKER)) {
+        const [before, after] = rawContent.split(INSERT_MARKER);
+        reply = before.trim();
+        suggestedInsert = after?.trim() || undefined;
+      } else {
+        reply = rawContent;
+        suggestedInsert = undefined;
+      }
+      if (!reply) {
+        reply = "Przepraszam, nie udało się wygenerować odpowiedzi — spróbuj zadać pytanie jeszcze raz.";
+      }
+
+      const now = new Date().toISOString();
+      const updated: ChatMessage[] = [
+        ...history,
+        { role: "user", content: message, ts: now },
+        { role: "assistant", content: reply, ts: now, insertText: suggestedInsert },
+      ];
+      store.chats[key] = updated;
+      writeStore(store);
+
+      res.json({ messages: updated });
+    } catch (error: any) {
+      console.error("[Chat] error:", error.message);
+      res.status(500).json({ error: "Błąd czatu AI: " + error.message });
+    }
+  });
+
+  app.post("/api/chat/clear", (req, res) => {
+    const { kwNumber, viewType } = req.body as { kwNumber?: string; viewType?: string };
+    if (!kwNumber || !viewType) {
+      return res.status(400).json({ error: "Brak kwNumber lub viewType." });
+    }
+    const store = readStore();
+    delete store.chats[chatKey(kwNumber, viewType)];
+    writeStore(store);
+    res.json({ messages: [] });
   });
 
   // Serve static assets in production

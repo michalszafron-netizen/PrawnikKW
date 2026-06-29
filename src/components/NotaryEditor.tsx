@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import {
   Copy,
   Download,
@@ -22,7 +22,9 @@ import {
   Shield,
   Scale,
   Building2,
-  RotateCcw
+  RotateCcw,
+  MessageCircle,
+  X
 } from "lucide-react";
 import {
   KWData,
@@ -169,6 +171,16 @@ function ApplicationDataBlock({ data }: { data?: string }) {
   );
 }
 
+// Polish display label for each internal TemplateStyle key — keeps the style
+// tabs and any other UI referencing a style (e.g. chat's "insert into draft")
+// showing the same name the notary sees, not the raw "classic"/"modern" key.
+const STYLE_LABELS: Record<TemplateStyle, string> = {
+  classic: "Tradycyjny (Aktowy)",
+  modern: "Współczesny",
+  short: "Skrócony",
+  custom: "Własny (od zera)",
+};
+
 // Small contextual visibility toggle — placed right next to the field group it
 // controls, so it's obvious what it affects (instead of one big global panel).
 function ToggleChip({
@@ -305,6 +317,68 @@ const AI_CREATION_PRESETS: { group: string; items: { label: string; prompt: stri
   },
 ];
 
+// Ready-to-use questions for "Czat o KW" — typical things a notary asks when
+// sizing up a księga before drafting an act. Selecting one fills the chat
+// input; the notary can still edit it before sending.
+const CHAT_PRESET_PROMPTS: { group: string; items: { label: string; prompt: string }[] }[] = [
+  {
+    group: "Sprawdzenie pod transakcję",
+    items: [
+      {
+        label: "Czy coś blokuje sprzedaż?",
+        prompt: "Czy w tej księdze są jakieś wzmianki, ostrzeżenia, hipoteki przymusowe lub egzekucje, które mogłyby blokować lub utrudniać sprzedaż nieruchomości?",
+      },
+      {
+        label: "Co przeoczyłem w edytorze?",
+        prompt: "Przeanalizuj surową treść tej księgi i powiedz, czy jest w niej coś istotnego prawnie, czego nie widzę w panelu edytora po lewej stronie.",
+      },
+      {
+        label: "Zgody współwłaścicieli / małżonków",
+        prompt: "Czy na podstawie udziałów i wspólności majątkowych widocznych w tej księdze, do zbycia nieruchomości potrzebne będą zgody współwłaścicieli lub małżonków? Kogo konkretnie dotyczą?",
+      },
+    ],
+  },
+  {
+    group: "Właściciele i udziały",
+    items: [
+      {
+        label: "Kto jest właścicielem i w jakich udziałach?",
+        prompt: "Kto jest właścicielem tej nieruchomości i w jakich udziałach? Wskaż też, czy któryś udział objęty jest wspólnością majątkową małżeńską.",
+      },
+      {
+        label: "Jaka jest podstawa nabycia?",
+        prompt: "Jaka jest podstawa nabycia własności dla każdego właściciela (rodzaj czynności, data, notariusz, numer Rep. A) — z surowej treści księgi, nie tylko ze skróconego opisu.",
+      },
+    ],
+  },
+  {
+    group: "Obciążenia",
+    items: [
+      {
+        label: "Pełna lista hipotek z wierzycielami",
+        prompt: "Wypisz wszystkie hipoteki wpisane w tej księdze (łącznie z wykreślonymi, jeśli widoczne w historii) wraz z kwotą, wierzycielem i tym, czy są aktualnie aktywne.",
+      },
+      {
+        label: "Czy są służebności lub roszczenia?",
+        prompt: "Czy w Dziale III tej księgi są wpisane jakieś służebności, roszczenia lub prawa osób trzecich? Jeśli tak, czego dotyczą i kogo obciążają?",
+      },
+    ],
+  },
+  {
+    group: "Nieruchomość",
+    items: [
+      {
+        label: "Pełne oznaczenie nieruchomości",
+        prompt: "Podaj pełne, dokładne oznaczenie nieruchomości z Działu I-O: położenie, numery działek, obręb, powierzchnia i sposób korzystania — z surowej treści, nie skrótu.",
+      },
+      {
+        label: "Historia przyłączeń/odłączeń",
+        prompt: "Czy w historii tej księgi widać przyłączenie lub odłączenie jakiejś nieruchomości/działki? Jeśli tak, kiedy i z jakiej/do jakiej księgi?",
+      },
+    ],
+  },
+];
+
 export default function NotaryEditor({
   initialData,
   initialDrafts,
@@ -323,10 +397,90 @@ export default function NotaryEditor({
   );
   const [viewMode, setViewMode] = useState<EditorViewMode>("editor");
 
+  // --- Chat about this księga (persistent per kwNumber+viewType, server-side) ---
+  const viewType = rawApify?.viewType === "aktualna" ? "aktualna" : "zupelna";
+  type ChatMsg = { role: "user" | "assistant"; content: string; ts: string; insertText?: string };
+  const [viewingChat, setViewingChat] = useState(false);
+  const [chatMessages, setChatMessages] = useState<ChatMsg[]>([]);
+  const [chatInput, setChatInput] = useState("");
+  const [isChatLoading, setIsChatLoading] = useState(false);
+  const chatEndRef = useRef<HTMLDivElement>(null);
+
   useEffect(() => {
     setData(initialData);
     setDrafts(initialDrafts);
   }, [initialData, initialDrafts]);
+
+  useEffect(() => {
+    if (!data.kwNumber) return;
+    fetch(`/api/chat?kwNumber=${encodeURIComponent(data.kwNumber)}&viewType=${encodeURIComponent(viewType)}`)
+      .then((r) => r.json())
+      .then((j) => setChatMessages(j.messages || []))
+      .catch(() => {});
+  }, [data.kwNumber, viewType]);
+
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [chatMessages, isChatLoading]);
+
+  const handleSendChat = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const text = chatInput.trim();
+    if (!text || isChatLoading) return;
+    setChatInput("");
+    setChatMessages((prev) => [...prev, { role: "user", content: text, ts: new Date().toISOString() }]);
+    setIsChatLoading(true);
+    try {
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ kwNumber: data.kwNumber, viewType, message: text, data, rawApify }),
+      });
+      const json = await res.json();
+      if (res.ok) {
+        setChatMessages(json.messages);
+      } else {
+        setChatMessages((prev) => [
+          ...prev,
+          { role: "assistant", content: "Błąd: " + (json.error || "nieznany"), ts: new Date().toISOString() },
+        ]);
+      }
+    } catch (err: any) {
+      setChatMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: "Błąd połączenia: " + err.message, ts: new Date().toISOString() },
+      ]);
+    } finally {
+      setIsChatLoading(false);
+    }
+  };
+
+  const handleClearChat = async () => {
+    if (!confirm("Wyczyścić historię rozmowy o tej księdze?")) return;
+    try {
+      await fetch("/api/chat/clear", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ kwNumber: data.kwNumber, viewType }),
+      });
+    } catch {
+      // best-effort
+    }
+    setChatMessages([]);
+  };
+
+  // Chat answers always insert into "custom" (Własny od zera) — that draft is
+  // the freeform one, not synced/regenerated from KWData like the other three,
+  // so building it up piece by piece from chat answers can't conflict with
+  // anything the notary edited elsewhere.
+  const handleInsertToDraft = (text: string) => {
+    setDrafts((prev) => ({
+      ...prev,
+      custom: prev.custom ? `${prev.custom}\n\n${text}` : text,
+    }));
+    setActiveStyle("custom");
+    setViewingChat(false);
+  };
 
   const vis = fieldVisibility;
   const toggleVis = (key: keyof FieldVisibilityConfig) =>
@@ -1548,63 +1702,177 @@ export default function NotaryEditor({
           <div className="bg-[#F5F2ED] border-b border-[#D1CEC8] px-6 py-4 flex flex-wrap gap-4 items-center justify-between">
             <div className="flex gap-2">
               {(
-                [
-                  ["classic", "Tradycyjny (Aktowy)"],
-                  ["modern", "Współczesny"],
-                  ["short", "Skrócony"],
-                  ["custom", "Własny (od zera)"],
-                ] as const
-              ).map(([key, label]) => (
+                Object.keys(STYLE_LABELS) as TemplateStyle[]
+              ).map((key) => (
                 <button
                   key={key}
-                  onClick={() => setActiveStyle(key)}
+                  onClick={() => {
+                    setActiveStyle(key);
+                    setViewingChat(false);
+                  }}
                   className={`text-[10px] uppercase font-bold tracking-widest py-2 px-3 transition-all cursor-pointer border-b-2 ${
-                    activeStyle === key
+                    !viewingChat && activeStyle === key
                       ? "border-[#1A1A1A] text-[#1A1A1A]"
                       : "border-transparent text-[#7A7772] hover:text-[#1A1A1A]"
                   }`}
                 >
-                  {label}
+                  {STYLE_LABELS[key]}
                 </button>
               ))}
+              <button
+                onClick={() => setViewingChat(true)}
+                className={`text-[10px] uppercase font-bold tracking-widest py-2 px-3 transition-all cursor-pointer border-b-2 flex items-center gap-1.5 ${
+                  viewingChat
+                    ? "border-blue-700 text-blue-700"
+                    : "border-transparent text-[#7A7772] hover:text-blue-700"
+                }`}
+              >
+                <MessageCircle className="w-3.5 h-3.5" /> Czat o KW
+              </button>
             </div>
 
             <div className="flex items-center gap-3">
-              <button
-                onClick={handleRestoreDrafts}
-                disabled={isUpdatingAI}
-                title="Przywróć pierwotny, wygenerowany tekst (cofa korekty AI i ręczne zmiany)"
-                className="text-[10px] font-bold uppercase tracking-widest border border-[#7A7772] text-[#7A7772] hover:bg-[#7A7772] hover:text-[#F5F2ED] py-2 px-4 transition-all duration-200 cursor-pointer bg-transparent flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed"
-              >
-                <RotateCcw className="w-3.5 h-3.5" /> Przywróć
-              </button>
-              <button
-                onClick={handleCopyToClipboard}
-                className="text-[10px] font-bold uppercase tracking-widest border border-[#1A1A1A] hover:bg-[#1A1A1A] hover:text-[#F5F2ED] py-2 px-4 transition-all duration-200 cursor-pointer bg-transparent text-[#1A1A1A] flex items-center gap-1.5"
-              >
-                {copySuccess ? (
-                  <>
-                    <Check className="w-3.5 h-3.5" /> Skopiowano
-                  </>
-                ) : (
-                  <>
-                    <Copy className="w-3.5 h-3.5" /> Kopiuj
-                  </>
-                )}
-              </button>
-              <button
-                onClick={handleDownloadText}
-                className="text-[10px] font-bold uppercase tracking-widest border border-[#1A1A1A] hover:bg-[#1A1A1A] hover:text-[#F5F2ED] py-2 px-4 transition-all duration-200 cursor-pointer bg-transparent text-[#1A1A1A] flex items-center gap-1.5"
-              >
-                <Download className="w-3.5 h-3.5" /> Pobierz .txt
-              </button>
+              {viewingChat ? (
+                <>
+                  <span className="text-[9px] text-amber-700 font-serif italic max-w-[260px] leading-snug">
+                    Każde pytanie dosyła CAŁĄ rozmowę do AI — dłuższy czat = więcej tokenów i większe ryzyko błędów. Czyść po zakończeniu wątku.
+                  </span>
+                  <button
+                    onClick={handleClearChat}
+                    disabled={chatMessages.length === 0}
+                    className="text-[10px] font-bold uppercase tracking-widest border border-[#7A7772] text-[#7A7772] hover:bg-[#7A7772] hover:text-[#F5F2ED] py-2 px-4 transition-all duration-200 cursor-pointer bg-transparent flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+                  >
+                    <X className="w-3.5 h-3.5" /> Wyczyść czat
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button
+                    onClick={handleRestoreDrafts}
+                    disabled={isUpdatingAI}
+                    title="Przywróć pierwotny, wygenerowany tekst (cofa korekty AI i ręczne zmiany)"
+                    className="text-[10px] font-bold uppercase tracking-widest border border-[#7A7772] text-[#7A7772] hover:bg-[#7A7772] hover:text-[#F5F2ED] py-2 px-4 transition-all duration-200 cursor-pointer bg-transparent flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5" /> Przywróć
+                  </button>
+                  <button
+                    onClick={handleCopyToClipboard}
+                    className="text-[10px] font-bold uppercase tracking-widest border border-[#1A1A1A] hover:bg-[#1A1A1A] hover:text-[#F5F2ED] py-2 px-4 transition-all duration-200 cursor-pointer bg-transparent text-[#1A1A1A] flex items-center gap-1.5"
+                  >
+                    {copySuccess ? (
+                      <>
+                        <Check className="w-3.5 h-3.5" /> Skopiowano
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-3.5 h-3.5" /> Kopiuj
+                      </>
+                    )}
+                  </button>
+                  <button
+                    onClick={handleDownloadText}
+                    className="text-[10px] font-bold uppercase tracking-widest border border-[#1A1A1A] hover:bg-[#1A1A1A] hover:text-[#F5F2ED] py-2 px-4 transition-all duration-200 cursor-pointer bg-transparent text-[#1A1A1A] flex items-center gap-1.5"
+                  >
+                    <Download className="w-3.5 h-3.5" /> Pobierz .txt
+                  </button>
+                </>
+              )}
             </div>
           </div>
 
+          {viewingChat && (
+            <div className="flex-1 flex flex-col overflow-hidden">
+              <div className="flex-1 overflow-y-auto custom-scroll p-5 space-y-3">
+                {chatMessages.length === 0 && (
+                  <div className="text-center py-8 text-[#7A7772] font-serif italic text-sm max-w-md mx-auto leading-relaxed">
+                    Zadaj pytanie o tę księgę — AI ma dostęp do pełnej, surowej treści wszystkich działów oraz danych ustrukturyzowanych z edytora. Rozmowa jest zapisywana trwale dla tej księgi.
+                  </div>
+                )}
+                {chatMessages.map((m, i) => (
+                  <div key={i} className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}>
+                    <div
+                      className={`max-w-[85%] px-4 py-2.5 text-sm font-serif leading-relaxed whitespace-pre-wrap ${
+                        m.role === "user"
+                          ? "bg-[#1A1A1A] text-white"
+                          : "bg-[#F5F2ED] border border-[#D1CEC8] text-[#1A1A1A]"
+                      }`}
+                    >
+                      {m.content}
+                      {m.role === "assistant" && m.content && (
+                        <button
+                          type="button"
+                          onClick={() => handleInsertToDraft(m.insertText || m.content)}
+                          className="mt-2 flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider text-[#1A1A1A] border border-[#1A1A1A] px-2.5 py-1.5 hover:bg-[#1A1A1A] hover:text-white transition-colors cursor-pointer"
+                        >
+                          <Plus className="w-3.5 h-3.5" /> Wstaw do draftu „{STYLE_LABELS.custom}"
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))}
+                {isChatLoading && (
+                  <div className="flex justify-start">
+                    <div className="bg-[#F5F2ED] border border-[#D1CEC8] px-4 py-2.5 text-sm text-[#7A7772] italic font-serif">
+                      AI analizuje księgę...
+                    </div>
+                  </div>
+                )}
+                <div ref={chatEndRef} />
+              </div>
+              <div className="border-t border-[#D1CEC8] p-4 space-y-2 bg-[#F5F2ED]">
+                <select
+                  value=""
+                  disabled={isChatLoading}
+                  onChange={(e) => {
+                    if (e.target.value) setChatInput(e.target.value);
+                  }}
+                  className="w-full bg-white border border-[#D1CEC8] px-3 py-1.5 text-xs font-serif text-[#1A1A1A] focus:outline-none focus:border-blue-700 cursor-pointer shadow-sm disabled:opacity-50"
+                >
+                  <option value="">— Podpowiedzi prawnicze (wybierz, aby wstawić do pola) —</option>
+                  {CHAT_PRESET_PROMPTS.map((grp) => (
+                    <optgroup key={grp.group} label={grp.group}>
+                      {grp.items.map((it) => (
+                        <option key={it.label} value={it.prompt}>
+                          {it.label}
+                        </option>
+                      ))}
+                    </optgroup>
+                  ))}
+                </select>
+                <form onSubmit={handleSendChat} className="flex gap-3">
+                  <input
+                    type="text"
+                    value={chatInput}
+                    onChange={(e) => setChatInput(e.target.value)}
+                    placeholder="Zapytaj o tę księgę, np. „czy są wzmianki blokujące sprzedaż?”..."
+                    disabled={isChatLoading}
+                    className="flex-1 bg-white border-b-2 border-[#1A1A1A] px-3 py-2.5 text-sm font-serif text-[#1A1A1A] placeholder-[#6B6965] focus:outline-none focus:border-blue-700 shadow-sm disabled:opacity-60"
+                  />
+                  <button
+                    type="submit"
+                    disabled={isChatLoading || !chatInput.trim()}
+                    className={`p-3 flex items-center justify-center text-white text-xs font-bold uppercase tracking-widest transition-colors cursor-pointer ${
+                      isChatLoading || !chatInput.trim()
+                        ? "bg-stone-300 text-stone-500 cursor-not-allowed border border-stone-200"
+                        : "bg-blue-700 hover:bg-blue-800"
+                    }`}
+                  >
+                    <Send className="w-5 h-5" />
+                  </button>
+                </form>
+              </div>
+            </div>
+          )}
+
           {/* Paper workspace */}
+          {!viewingChat && (
+          <>
+
           <div className="flex-1 p-5 lg:p-6 bg-[#F5F2ED]/60 relative flex flex-col">
-            <div className="text-[9px] font-mono font-bold uppercase tracking-wider text-[#7A7772]/80 absolute top-4 right-6 flex items-center gap-1.5 select-none">
-              <FileText className="w-3.5 h-3.5" /> Repertorium A draft
+            <div className="flex justify-end mb-2 shrink-0">
+              <span className="text-[9px] font-mono font-bold uppercase tracking-wider text-[#7A7772]/80 flex items-center gap-1.5 select-none">
+                <FileText className="w-3.5 h-3.5" /> Repertorium A draft
+              </span>
             </div>
 
             <div className="flex-1 bg-[#FCFBFA] border border-[#D1CEC8] p-5 sm:p-7 shadow-inner flex flex-col min-h-[160px] relative overflow-hidden">
@@ -1714,6 +1982,8 @@ export default function NotaryEditor({
               </div>
             </form>
           </div>
+          </>
+          )}
         </div>
       </div>
     </div>

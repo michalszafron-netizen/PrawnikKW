@@ -34,7 +34,7 @@ const KW_CACHE_KEY = "lexparser_kw_cache";
 // Must match PARSER_VERSION in server.ts. If a cached entry was mapped by an
 // older parser, we re-map it from its stored rawApify (no Apify/network call
 // needed) the next time it's opened from the library — see remapIfStale().
-const MIN_PARSER_VERSION = 9;
+const MIN_PARSER_VERSION = 11;
 
 function getCachedBooks(): CachedKW[] {
   try {
