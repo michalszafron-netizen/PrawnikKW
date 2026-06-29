@@ -7,6 +7,7 @@ import express from "express";
 import path from "path";
 import fs from "fs";
 import https from "https";
+import crypto from "crypto";
 import { createServer as createViteServer } from "vite";
 import OpenAI from "openai";
 import dotenv from "dotenv";
@@ -1056,6 +1057,39 @@ async function startServer() {
 
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ extended: true, limit: "50mb" }));
+
+  // ---- Temporary HTTP Basic Auth gate (testing phase) ----------------------------
+  // Protects the whole app (frontend + API) behind one shared username/password.
+  // Only active when both env vars are set, so local dev without them stays open.
+  // Remove this block (and the env vars) once testing is over and real auth lands.
+  const BASIC_AUTH_USER = process.env.BASIC_AUTH_USER;
+  const BASIC_AUTH_PASS = process.env.BASIC_AUTH_PASS;
+
+  const timingSafeEqualStr = (a: string, b: string): boolean => {
+    const bufA = Buffer.from(a);
+    const bufB = Buffer.from(b);
+    if (bufA.length !== bufB.length) return false;
+    return crypto.timingSafeEqual(bufA, bufB);
+  };
+
+  if (BASIC_AUTH_USER && BASIC_AUTH_PASS) {
+    app.use((req, res, next) => {
+      const header = req.headers.authorization;
+      if (header && header.startsWith("Basic ")) {
+        const decoded = Buffer.from(header.slice(6), "base64").toString("utf-8");
+        const sepIdx = decoded.indexOf(":");
+        const user = sepIdx >= 0 ? decoded.slice(0, sepIdx) : decoded;
+        const pass = sepIdx >= 0 ? decoded.slice(sepIdx + 1) : "";
+        if (timingSafeEqualStr(user, BASIC_AUTH_USER) && timingSafeEqualStr(pass, BASIC_AUTH_PASS)) {
+          return next();
+        }
+      }
+      res.set("WWW-Authenticate", 'Basic realm="Prawosfera - dostep testowy"');
+      res.status(401).send("Autoryzacja wymagana.");
+    });
+  } else {
+    console.warn("[Auth] BASIC_AUTH_USER/BASIC_AUTH_PASS nie ustawione — aplikacja jest publicznie dostępna bez hasła.");
+  }
 
   // Helper system prompts
   const GENERATION_SYSTEM_INSTRUCTION = `Jesteś ekspertem prawnym, polskim notariuszem oraz specjalistą ds. analizy ksiąg wieczystych (EKW).
