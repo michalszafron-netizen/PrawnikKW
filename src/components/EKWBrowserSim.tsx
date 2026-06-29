@@ -60,11 +60,11 @@ function removeFromCache(kwNumber: string, viewType: string) {
   saveCachedBooks(books);
 }
 
-// --- Monthly EKW query counter (per browser profile; no backend) ----------------
-// Apify free tier ≈ 35 fetches/month; the $10 plan ≈ 1000/month. We track real
-// fetches locally so the notary sees how many paid lookups they've used.
+// --- Monthly EKW query counter (server-side, kw_store.json — see /api/usage) ----
+// Apify $10 plan caps at ~1000/month, but this is set lower (150) to match a
+// realistic monthly budget for a single notary's office during testing.
 const QUERY_COUNTER_KEY = "lexparser_query_counter";
-const MONTHLY_QUERY_LIMIT = 1000;
+const MONTHLY_QUERY_LIMIT = 150;
 // A cached księga older than this many days triggers a "may be outdated" warning.
 const STALE_AFTER_DAYS = 7;
 
